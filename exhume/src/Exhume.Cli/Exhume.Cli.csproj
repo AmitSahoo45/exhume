@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Exhume.Core/Exhume.Core.csproj" />
+    <ProjectReference Include="../Exhume.Narration/Exhume.Narration.csproj" />
+    <ProjectReference Include="../Exhume.Adapters.FileSystem/Exhume.Adapters.FileSystem.csproj" />
+    <ProjectReference Include="../Exhume.Adapters.Browser/Exhume.Adapters.Browser.csproj" />
+    <ProjectReference Include="../Exhume.Adapters.Windows/Exhume.Adapters.Windows.csproj" />
+    <ProjectReference Include="../Exhume.Adapters.Git/Exhume.Adapters.Git.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Spectre.Console" Version="0.57.2" />
+    <PackageReference Include="Spectre.Console.Cli" Version="0.57.2" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="../../prompts/**/*.txt" Link="prompts/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
