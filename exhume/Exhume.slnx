@@ -1,0 +1,20 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Exhume.Core/Exhume.Core.csproj" />
+    <Project Path="src/Exhume.Narration/Exhume.Narration.csproj" />
+    <Project Path="src/Exhume.Adapters.FileSystem/Exhume.Adapters.FileSystem.csproj" />
+    <Project Path="src/Exhume.Adapters.Browser/Exhume.Adapters.Browser.csproj" />
+    <Project Path="src/Exhume.Adapters.Windows/Exhume.Adapters.Windows.csproj" />
+    <Project Path="src/Exhume.Adapters.Git/Exhume.Adapters.Git.csproj" />
+    <Project Path="src/Exhume.Cli/Exhume.Cli.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Exhume.Core.Tests/Exhume.Core.Tests.csproj" />
+    <Project Path="tests/Exhume.Narration.Tests/Exhume.Narration.Tests.csproj" />
+    <Project Path="tests/Exhume.Adapters.FileSystem.Tests/Exhume.Adapters.FileSystem.Tests.csproj" />
+    <Project Path="tests/Exhume.Adapters.Browser.Tests/Exhume.Adapters.Browser.Tests.csproj" />
+    <Project Path="tests/Exhume.Adapters.Windows.Tests/Exhume.Adapters.Windows.Tests.csproj" />
+    <Project Path="tests/Exhume.Adapters.Git.Tests/Exhume.Adapters.Git.Tests.csproj" />
+    <Project Path="tests/Exhume.Cli.Tests/Exhume.Cli.Tests.csproj" />
+  </Folder>
+</Solution>
