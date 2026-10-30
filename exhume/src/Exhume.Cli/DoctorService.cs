@@ -90,7 +90,7 @@ public sealed class DoctorService(HttpClient client)
         var sources = new Dictionary<string, SourceStatus>(StringComparer.OrdinalIgnoreCase);
         foreach (var name in new[] { "windows", "browser", "folder", "git" })
         {
-            sources[name] = new(SourceAvailability.Unavailable, "not implemented");
+            sources[name] = new(SourceAvailability.Unavailable, "No adapter registered.");
         }
         foreach (var adapter in adapters ?? [])
         {

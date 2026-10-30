@@ -56,14 +56,3 @@ public class ViewSettings : SharedSettings
     [Description("Render raw evidence without model calls.")]
     public bool NoModel { get; init; }
 }
-
-public abstract class StubCommand<TSettings>(IAnsiConsole console) : Command<TSettings>
-    where TSettings : SharedSettings
-{
-    public override int Execute(CommandContext context, TSettings settings, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        console.Write(new Text($"not implemented{Environment.NewLine}"));
-        return 0;
-    }
-}

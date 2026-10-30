@@ -2,4 +2,7 @@
   <ItemGroup>
     <ProjectReference Include="../Exhume.Core/Exhume.Core.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="MetadataExtractor" Version="2.9.3" />
+  </ItemGroup>
 </Project>

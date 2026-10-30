@@ -30,7 +30,7 @@ public sealed class CliHostTests
         {
             Assert.Contains(source, output.ToString());
         }
-        Assert.Contains("not implemented", output.ToString());
+        Assert.Contains("No adapter registered", output.ToString());
     }
 
     [Fact]
@@ -227,31 +227,10 @@ public sealed class CliHostTests
         Assert.Empty(handler.Requests);
     }
 
-    [Theory]
-    [InlineData("dig", "--source", "folder", "--path", "fixture")]
-    [InlineData("timeline", "--no-model", "--source", "folder", "--year", "2024")]
-    [InlineData("obituaries", "--no-model", "--limit", "5")]
-    [InlineData("eras", "--no-model", "--source", "folder", "--year", "2024")]
-    [InlineData("haunt", "--no-model", "--path", "fixture", "--author", "owner")]
-    [InlineData("export", "--no-model", "--path", "report.md", "--redact")]
-    [InlineData("forget")]
-    public async Task Future_commands_are_safe_stubs_without_model_or_storage_work(params string[] arguments)
-    {
-        using var directory = new TestDirectory();
-        using var output = new StringWriter();
-        using var handler = new ResponseHandler(_ => throw new InvalidOperationException("HTTP must not run"));
-
-        var code = await CreateHost(directory, output, handler).RunAsync(arguments);
-
-        Assert.Equal(0, code);
-        Assert.Contains("not implemented", output.ToString());
-        Assert.Empty(handler.Requests);
-        Assert.False(Directory.Exists(Path.Combine(directory.Path, ".exhume")));
-    }
-
     private static CliHost CreateHost(TestDirectory directory, StringWriter output, HttpMessageHandler handler) => new(
         CreateConsole(output),
         handler,
+        adapters: [],
         environment: new Dictionary<string, string?>(),
         workingDirectory: directory.Path,
         configFilePath: Path.Combine(directory.Path, "absent.json"));

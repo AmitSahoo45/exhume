@@ -3,8 +3,11 @@ using Spectre.Console.Cli;
 
 namespace Exhume.Cli.Commands;
 
-public sealed class DigCommand(IAnsiConsole console) : StubCommand<DigCommand.Settings>(console)
+public sealed class DigCommand(CommandServices services) : AsyncCommand<DigCommand.Settings>
 {
+    public override Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellationToken) =>
+        services.RunDigAsync(settings, cancellationToken);
+
     public sealed class Settings : SharedSettings
     {
         [CommandOption("--source <SOURCE>")]

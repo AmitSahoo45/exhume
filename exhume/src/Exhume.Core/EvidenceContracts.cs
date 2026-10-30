@@ -15,7 +15,7 @@ public sealed record ScanOptions
     public string? TemporaryDirectory { get; init; }
 }
 
-public sealed record ScanProgress(string Source, string Stage, long ItemsDone, long? Total = null);
+public sealed record ScanProgress(string Source, string Stage, long ItemsDone, long? Total = null, string? Error = null);
 
 public interface IEvidenceAdapter
 {

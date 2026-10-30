@@ -4,7 +4,7 @@ using Spectre.Console;
 
 namespace Exhume.Cli;
 
-public sealed class CommandServices(
+public sealed partial class CommandServices(
     IAnsiConsole console,
     HttpMessageHandler? httpHandler,
     Func<ExhumeConfig, IArtifactStore>? storeFactory,
@@ -37,7 +37,7 @@ public sealed class CommandServices(
                 : new HttpClient(httpHandler, disposeHandler: false);
             client.Timeout = Timeout.InfiniteTimeSpan;
             var model = await new DoctorService(client).CheckModelAsync(config, cancellationToken);
-            var sources = DoctorService.CheckSources(adapters, new ScanOptions { TemporaryDirectory = config.TemporaryDirectory });
+            var sources = DoctorService.CheckSources(RegisteredAdapters, new ScanOptions { TemporaryDirectory = config.TemporaryDirectory });
             Render(configuration, counts, model, sources);
             return 0;
         }
@@ -72,7 +72,7 @@ public sealed class CommandServices(
         {
             Write($"{source.Key}: {source.Value.Availability} - {source.Value.Reason}");
         }
-        Write("Narration calls: 0");
+        Write($"Narration calls: {narrationCalls}");
     }
 
     private void WriteConfiguration(string name, string value, string key, ConfigurationResult result) =>

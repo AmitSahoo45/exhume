@@ -36,18 +36,23 @@ public sealed class CliHost
             configuration.Settings.Registrar.RegisterInstance<IAnsiConsole>(_console);
             configuration.Settings.Registrar.RegisterInstance(_services);
             configuration.AddCommand<DoctorCommand>("doctor").WithDescription("Report configuration, storage and source health.");
-            configuration.AddCommand<DigCommand>("dig").WithDescription("Scan evidence sources (not implemented).");
-            configuration.AddCommand<TimelineCommand>("timeline").WithDescription("View the timeline (not implemented).");
-            configuration.AddCommand<ObituariesCommand>("obituaries").WithDescription("View program obituaries (not implemented).");
-            configuration.AddCommand<ErasCommand>("eras").WithDescription("View source eras (not implemented).");
-            configuration.AddCommand<HauntCommand>("haunt").WithDescription("View comments from the past self (not implemented).");
-            configuration.AddCommand<ExportCommand>("export").WithDescription("Export a report (not implemented).");
-            configuration.AddCommand<ForgetCommand>("forget").WithDescription("Forget stored evidence (not implemented).");
+            configuration.AddCommand<DigCommand>("dig").WithDescription("Read evidence sources into the local store.");
+            configuration.AddCommand<TimelineCommand>("timeline").WithDescription("View months, source counts and a selected era.");
+            configuration.AddCommand<ObituariesCommand>("obituaries").WithDescription("View program obituaries, newest first.");
+            configuration.AddCommand<ErasCommand>("eras").WithDescription("View monthly source summaries.");
+            configuration.AddCommand<HauntCommand>("haunt").WithDescription("Review the current diff in a past self's voice.");
+            configuration.AddCommand<ExportCommand>("export").WithDescription("Write a Markdown evidence report.");
+            configuration.AddCommand<ForgetCommand>("forget").WithDescription("Forget stored evidence after explicit confirmation.");
         });
 
         try
         {
             return await app.RunAsync(args, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            ConsoleText.WriteLine(_console, "Operation cancelled.");
+            return 2;
         }
         catch (Exception exception) when (exception is CommandParseException or CommandRuntimeException or ArgumentException or InvalidDataException)
         {
