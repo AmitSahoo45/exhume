@@ -182,12 +182,13 @@ public sealed class ConfigurationTests : IDisposable
     [Fact]
     public void CDriveDataDirectoryIsRejectedBeforeAnyDirectoryIsCreated()
     {
-        var exception = Assert.Throws<ArgumentException>(() => Load(new ConfigOverrides
+        var exception = Assert.Throws<DataDirectoryAccessException>(() => Load(new ConfigOverrides
         {
             DataDirectory = @"C:\exhume-policy-test"
         }));
 
         Assert.Contains("EXHUME_HOME", exception.Message);
+        Assert.Equal(@"C:\exhume-policy-test", exception.RequestedPath);
     }
 
     [Fact]

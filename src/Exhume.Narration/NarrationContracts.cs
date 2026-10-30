@@ -37,6 +37,11 @@ public interface INarrationService
         PersonaInput input,
         CancellationToken cancellationToken = default);
 
+    Task<NarrationResult<Persona>> BuildPersonaAsync(
+        PersonaContext context,
+        Func<CancellationToken, Task<PersonaInput>> inputFactory,
+        CancellationToken cancellationToken = default);
+
     Task<NarrationResult<IReadOnlyList<HauntComment>>> HauntAsync(
         Persona persona,
         DiffChunk chunk,

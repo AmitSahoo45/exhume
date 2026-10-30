@@ -45,8 +45,14 @@ public static class ConfigurationLoader
             throw new ArgumentException("Model tag must be nonempty and contain no control characters; configure EXHUME_MODEL.");
         }
 
+        string normalizedDirectory;
+        try { normalizedDirectory = DataDirectoryPolicy.Normalize(dataDirectory, workingDirectory); }
+        catch (Exception error) when (error is ArgumentException or IOException or UnauthorizedAccessException)
+        {
+            throw new DataDirectoryAccessException(dataDirectory, error);
+        }
         var config = new ExhumeConfig(ollamaUrl, modelTag.Trim(),
-            DataDirectoryPolicy.Normalize(dataDirectory, workingDirectory),
+            normalizedDirectory,
             TimeSpan.FromSeconds(timeout), maximumAttempts);
         return new ConfigurationResult(config, new ReadOnlyDictionary<string, string>(origins));
 
@@ -109,4 +115,10 @@ public static class ConfigurationLoader
             throw new InvalidDataException("The configuration file could not be read. Check its availability.");
         }
     }
+}
+
+public sealed class DataDirectoryAccessException(string requestedPath, Exception inner)
+    : IOException("The configured data directory is unavailable or prohibited. Set EXHUME_HOME to a writable local directory off C:.", inner)
+{
+    public string RequestedPath { get; } = requestedPath;
 }

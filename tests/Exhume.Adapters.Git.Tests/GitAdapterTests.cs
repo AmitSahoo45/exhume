@@ -126,7 +126,7 @@ public sealed class GitAdapterTests
         Commands.Stage(fixture.Repository, "deleted.cs");
         var before = fixture.Fingerprint();
 
-        var chunks = await new GitAdapter().ReadDiffAsync(fixture.Options);
+        var chunks = await new GitAdapter().ReadDiffAsync(fixture.Options with { IncludeUntracked = true });
 
         Assert.Equal(["deleted.cs", "fresh.cs", "staged.cs", "unstaged.cs"], chunks.Select(x => x.File).Order().ToArray());
         Assert.Contains("staged new", Assert.Single(chunks, x => x.File == "staged.cs").Text);
@@ -166,7 +166,7 @@ public sealed class GitAdapterTests
         for (var i = 0; i < 25; i++)
             fixture.Write($"new-{i:00}.cs", string.Join('\n', Enumerable.Range(1, 300).Select(x => $"line {x}")) + "\n");
 
-        var chunks = await new GitAdapter().ReadDiffAsync(fixture.Options);
+        var chunks = await new GitAdapter().ReadDiffAsync(fixture.Options with { IncludeUntracked = true });
 
         Assert.Equal(20, chunks.Count);
         Assert.All(chunks, x => Assert.True(x.Truncated));
@@ -180,9 +180,155 @@ public sealed class GitAdapterTests
         using var fixture = new RepositoryFixture();
         Assert.Empty(await new GitAdapter().ReadDiffAsync(fixture.Options));
         fixture.Write("first.cs", "first\n");
-        Assert.Single(await new GitAdapter().ReadDiffAsync(fixture.Options));
+        Assert.Empty(await new GitAdapter().ReadDiffAsync(fixture.Options));
+        Assert.Single(await new GitAdapter().ReadDiffAsync(fixture.Options with { IncludeUntracked = true }));
         fixture.Commit("2023-01-01T00:00:00Z", "First", "first.cs", "first\n");
         Assert.Empty(await new GitAdapter().ReadDiffAsync(fixture.Options));
+    }
+
+    [Fact]
+    public async Task MissingAuthorDuringDiscoveryWarnsAndContinuesWithLaterRepository()
+    {
+        using var root = new RepositoryFixture();
+        root.Repository.Config.Set("user.email", "");
+        using var nested = new RepositoryFixture(Path.Combine(root.Root, "nested"));
+        nested.Commit("2023-01-01T00:00:00Z", "Visible", "one.cs", "one\n");
+        var progress = new CaptureProgress();
+
+        var artifacts = await Collect(new GitAdapter(), root.Options with { ScanRepositories = true }, progress);
+
+        Assert.Single(artifacts);
+        Assert.Contains(progress.Items, x => x.Warning is not null && !x.Warning.Contains(root.Root, StringComparison.Ordinal));
+        Assert.DoesNotContain(progress.Items, x => x.Error is not null);
+    }
+
+    [Fact]
+    public async Task MissingAuthorWithoutAnyReadableRepositoryReportsWholeSourceFailure()
+    {
+        using var fixture = new RepositoryFixture();
+        fixture.Repository.Config.Set("user.email", "");
+        var progress = new CaptureProgress();
+
+        Assert.Empty(await Collect(new GitAdapter(), fixture.Options, progress));
+
+        Assert.Contains(progress.Items, x => x.Error is not null);
+    }
+
+    [Fact]
+    public async Task DiffDefaultsToTrackedEditsAndPrioritizesThemWhenUntrackedIsEnabled()
+    {
+        using var fixture = new RepositoryFixture();
+        fixture.Commit("2023-01-01T00:00:00Z", "Tracked", "z-tracked.cs", "old\n");
+        fixture.Write("z-tracked.cs", "changed\n");
+        for (var index = 0; index < 25; index++) fixture.Write($"a-scratch-{index:00}.txt", "scratch\n");
+        fixture.Write(".env", "private value\n");
+
+        var defaultChunks = await new GitAdapter().ReadDiffAsync(fixture.Options);
+        var optedIn = await new GitAdapter().ReadDiffAsync(fixture.Options with { IncludeUntracked = true });
+
+        Assert.Equal("z-tracked.cs", Assert.Single(defaultChunks).File);
+        Assert.Equal("z-tracked.cs", optedIn[0].File);
+        Assert.Equal(20, optedIn.Count);
+        Assert.All(optedIn, chunk => Assert.True(chunk.Truncated));
+        Assert.All(optedIn, chunk => Assert.Equal(7, chunk.OmittedFileCount));
+    }
+
+    [Fact]
+    public async Task ConfiguredAppDataIsExcludedFromTrackedAndUntrackedDiffs()
+    {
+        using var fixture = new RepositoryFixture();
+        fixture.Commit("2023-01-01T00:00:00Z", "Tracked", "appdata/tracked.txt", "old private\n");
+        fixture.Commit("2023-01-02T00:00:00Z", "Code", "code.cs", "old\n");
+        fixture.Write("appdata/tracked.txt", "new private\n");
+        fixture.Write("appdata/exhume.db", "stored private data\n");
+        fixture.Write("appdata/reports/review.md", "private report\n");
+        fixture.Write("appdata-sibling.txt", "allowed\n");
+        fixture.Write("code.cs", "new\n");
+
+        var chunks = await new GitAdapter().ReadDiffAsync(fixture.Options with
+        {
+            IncludeUntracked = true, ExcludedPaths = [Path.Combine(fixture.Root, "appdata")]
+        });
+
+        Assert.Equal(["code.cs", "appdata-sibling.txt"], chunks.Select(x => x.File));
+        Assert.DoesNotContain(chunks, chunk => chunk.Text.Contains("private", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void PersonaContextResolvesRepositoryRootFromNestedPathsWithoutReadingHistory()
+    {
+        using var fixture = new RepositoryFixture();
+        fixture.Commit("2023-01-01T00:00:00Z", "Older", "one.cs", "old\n");
+        var oldCommit = fixture.Repository.Head.Tip.Sha;
+        fixture.Commit("2023-01-02T00:00:00Z", "Newer", "one.cs", "new\n");
+        var oldObject = Path.Combine(fixture.Root, ".git", "objects", oldCommit[..2], oldCommit[2..]);
+        File.SetAttributes(oldObject, FileAttributes.Normal);
+        File.Delete(oldObject);
+        Directory.CreateDirectory(Path.Combine(fixture.Root, "nested", "child"));
+        var explicitCutoff = new DateTimeOffset(2020, 4, 5, 6, 7, 8, TimeSpan.Zero);
+
+        var context = new GitAdapter().GetPersonaContext(fixture.Options with
+        {
+            Path = Path.Combine(fixture.Root, "nested", "child"), Author = "OWNER@example.invalid", Cutoff = explicitCutoff
+        });
+
+        Assert.Equal(fixture.Root, context.RepositoryPath);
+        Assert.Equal("owner@example.invalid", context.Author);
+        Assert.Equal(explicitCutoff, context.Cutoff);
+    }
+
+    [Fact]
+    public void PersonaContextResolvesParentJunctionAndGitDirectoryToSameWorkingTree()
+    {
+        using var fixture = new RepositoryFixture();
+        Directory.CreateDirectory(Path.Combine(fixture.Root, "nested"));
+        var alias = Path.Combine(fixture.Root, "alias");
+        CreateDirectoryLink(alias, fixture.Root);
+        try
+        {
+            var adapter = new GitAdapter();
+            var context = adapter.GetPersonaContext(fixture.Options with { Path = Path.Combine(alias, "nested") });
+            var metadataContext = adapter.GetPersonaContext(fixture.Options with { Path = Path.Combine(alias, ".git") });
+
+            Assert.Equal(fixture.Root, context.RepositoryPath);
+            Assert.Equal(context, metadataContext);
+        }
+        finally { Directory.Delete(alias); }
+    }
+
+    [Fact]
+    public void PersonaContextUsesLinkedWorktreeRootInsteadOfMainRepository()
+    {
+        using var fixture = new RepositoryFixture();
+        fixture.Commit("2023-01-01T00:00:00Z", "Initial", "one.cs", "one\n");
+        var linkedPath = Path.Combine(fixture.Root, "linked-worktree");
+        fixture.Repository.Worktrees.Add("fixture-worktree", linkedPath, false);
+        Directory.CreateDirectory(Path.Combine(linkedPath, "nested"));
+
+        var context = new GitAdapter().GetPersonaContext(fixture.Options with { Path = Path.Combine(linkedPath, "nested") });
+
+        Assert.Equal(linkedPath, context.RepositoryPath);
+    }
+
+    [Fact]
+    public async Task ReadingContextHistoryAndDiffPreservesIndexAndAllSourceFileMetadata()
+    {
+        using var fixture = new RepositoryFixture();
+        fixture.Commit("2020-01-01T00:00:00Z", "Initial", "one.cs", "one\n");
+        fixture.Write("one.cs", "staged\n");
+        Commands.Stage(fixture.Repository, "one.cs");
+        fixture.Write("one.cs", "working\n");
+        fixture.Write("new.cs", "untracked\n");
+        File.SetLastWriteTimeUtc(Path.Combine(fixture.Root, ".git", "index"), new DateTime(2001, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        var before = fixture.Fingerprint();
+        var adapter = new GitAdapter();
+
+        _ = adapter.GetPersonaContext(fixture.Options);
+        _ = await adapter.BuildPersonaInputAsync(fixture.Options);
+        _ = await Collect(adapter, fixture.Options);
+        _ = await adapter.ReadDiffAsync(fixture.Options with { IncludeUntracked = true });
+
+        Assert.Equal(before, fixture.Fingerprint());
     }
 
     [Fact]
@@ -208,11 +354,30 @@ public sealed class GitAdapterTests
         });
     }
 
-    private static async Task<List<Artifact>> Collect(GitAdapter adapter, ScanOptions options)
+    private static async Task<List<Artifact>> Collect(GitAdapter adapter, ScanOptions options, IProgress<ScanProgress>? progress = null)
     {
         var items = new List<Artifact>();
-        await foreach (var item in adapter.ScanAsync(options)) items.Add(item);
+        await foreach (var item in adapter.ScanAsync(options, progress)) items.Add(item);
         return items;
+    }
+
+    private static void CreateDirectoryLink(string link, string target)
+    {
+        if (!OperatingSystem.IsWindows()) { Directory.CreateSymbolicLink(link, target); return; }
+        var start = new System.Diagnostics.ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"))
+        {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true
+        };
+        foreach (var argument in new[] { "/c", "mklink", "/J", link, target }) start.ArgumentList.Add(argument);
+        using var process = System.Diagnostics.Process.Start(start)!;
+        process.WaitForExit();
+        Assert.True(process.ExitCode == 0, process.StandardError.ReadToEnd());
+    }
+
+    private sealed class CaptureProgress : IProgress<ScanProgress>
+    {
+        public List<ScanProgress> Items { get; } = [];
+        public void Report(ScanProgress value) => Items.Add(value);
     }
 
     private sealed class RepositoryFixture : IDisposable
@@ -230,7 +395,12 @@ public sealed class GitAdapterTests
             Repository.Config.Set("user.email", "owner@example.invalid");
             Repository.Config.Set("core.autocrlf", false);
         }
-        public void Write(string name, string text) => File.WriteAllText(Path.Combine(Root, name), text);
+        public void Write(string name, string text)
+        {
+            var path = Path.Combine(Root, name);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, text);
+        }
         public void Commit(string when, string subject, string file, string text, string email = "owner@example.invalid")
         {
             Write(file, text);
@@ -238,8 +408,14 @@ public sealed class GitAdapterTests
             var signature = new Signature("owner", email, DateTimeOffset.Parse(when));
             Repository.Commit(subject, signature, signature);
         }
-        public string[] Fingerprint() => Directory.EnumerateFiles(Root, "*", SearchOption.AllDirectories).Order()
-            .Select(x => Path.GetRelativePath(Root, x) + ":" + Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(x)))).ToArray();
+        public string[] Fingerprint() => Directory.EnumerateFileSystemEntries(Root, "*", SearchOption.AllDirectories).Order()
+            .Select(path =>
+            {
+                FileSystemInfo info = Directory.Exists(path) ? new DirectoryInfo(path) : new FileInfo(path);
+                var fileEvidence = info is FileInfo file
+                    ? file.Length + ":" + Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))) : "directory";
+                return Path.GetRelativePath(Root, path) + ":" + info.CreationTimeUtc.Ticks + ":" + info.LastWriteTimeUtc.Ticks + ":" + info.Attributes + ":" + fileEvidence;
+            }).ToArray();
         public void Dispose()
         {
             Repository.Dispose();

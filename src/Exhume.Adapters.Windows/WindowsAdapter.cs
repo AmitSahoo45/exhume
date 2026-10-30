@@ -172,7 +172,7 @@ public sealed class WindowsAdapter : IEvidenceAdapter
                     if (candidate.NameRank < 2) { candidate.Name = folderName; candidate.NameRank = 2; }
                     candidate.AddEvidence("LeftoverFolder", path, times.Created, times.Modified);
                 }
-                catch (Exception error) when (IsReadError(error)) { ReportError(progress, "leftover folder skipped"); }
+                catch (Exception error) when (IsReadError(error)) { ReportWarning(progress, "leftover folder skipped"); }
             }
         }
         progress?.Report(new(Name, "LeftoverFolder", examined));
@@ -181,9 +181,13 @@ public sealed class WindowsAdapter : IEvidenceAdapter
         {
             var status = CheckPrefetch(options);
             if (status.Availability != SourceAvailability.Available)
-                progress?.Report(new(Name, "Prefetch skipped", examined, Error: status.Reason));
+                progress?.Report(new(Name, "Prefetch skipped", examined, Warning: status.Reason));
             else
             {
+                var executableDirectories = new[] { folders.System32, folders.SysWow64, folders.Windows }
+                    .Concat(installed.Select(app => app.Location))
+                    .Where(directory => !string.IsNullOrWhiteSpace(directory) && Path.IsPathFullyQualified(directory))
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
                 foreach (var path in ReadPrefetch(progress))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -197,11 +201,20 @@ public sealed class WindowsAdapter : IEvidenceAdapter
                     if (livingKeys.Contains(key) || installed.Any(app => MatchesProgramName(app, key))) continue;
                     try
                     {
+                        if (executableDirectories.Any(directory =>
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            return probe.FileExists(Path.Combine(directory, executable));
+                        }))
+                        {
+                            livingKeys.Add(key);
+                            continue;
+                        }
                         var times = probe.Times(path);
                         var candidate = GetCandidate(key, Path.GetFileNameWithoutExtension(executable));
                         candidate.AddEvidence("Prefetch", path, times.Created, times.Modified);
                     }
-                    catch (Exception error) when (IsReadError(error)) { ReportError(progress, "Prefetch file skipped"); }
+                    catch (Exception error) when (IsReadError(error)) { ReportWarning(progress, "Prefetch item skipped"); }
                 }
             }
         }
@@ -239,7 +252,8 @@ public sealed class WindowsAdapter : IEvidenceAdapter
             var path = ResolveKnownFolder(rawPath.Trim().Trim('"'), out var resolved);
             if (!resolved)
             {
-                progress?.Report(new(Name, source + " unresolved path skipped", examined));
+                progress?.Report(new(Name, source + " unresolved path skipped", examined,
+                    Warning: "An executable location was unresolved and could not be classified as dead."));
                 return;
             }
             if (!IsExecutablePath(path)) return;
@@ -252,7 +266,7 @@ public sealed class WindowsAdapter : IEvidenceAdapter
                     return;
                 }
             }
-            catch (Exception error) when (IsReadError(error)) { ReportError(progress, source + " item skipped"); return; }
+            catch (Exception error) when (IsReadError(error)) { ReportWarning(progress, source + " item skipped"); return; }
             var candidate = GetCandidate(key, Path.GetFileNameWithoutExtension(path));
             candidate.Executable ??= path;
             candidate.Publisher ??= publisher;
@@ -334,7 +348,7 @@ public sealed class WindowsAdapter : IEvidenceAdapter
         catch (Exception error) when (IsReadError(error))
         {
             onError?.Invoke();
-            ReportError(progress, "registry key skipped");
+            ReportWarning(progress, "registry key skipped");
             return [];
         }
     }
@@ -349,23 +363,23 @@ public sealed class WindowsAdapter : IEvidenceAdapter
             foreach (var name in key.ValueNames)
             {
                 try { result.Add((name, key.ReadValue(name))); }
-                catch (Exception error) when (IsReadError(error)) { onError?.Invoke(); ReportError(progress, "registry value skipped"); }
+                catch (Exception error) when (IsReadError(error)) { onError?.Invoke(); ReportWarning(progress, "registry value skipped"); }
             }
         }
-        catch (Exception error) when (IsReadError(error)) { onError?.Invoke(); ReportError(progress, "registry key skipped"); }
+        catch (Exception error) when (IsReadError(error)) { onError?.Invoke(); ReportWarning(progress, "registry key skipped"); }
         return result;
     }
 
     private string[] ReadDirectories(string path, IProgress<ScanProgress>? progress)
     {
         try { return probe.Directories(path).ToArray(); }
-        catch (Exception error) when (IsReadError(error)) { ReportError(progress, "application data folder skipped"); return []; }
+        catch (Exception error) when (IsReadError(error)) { ReportWarning(progress, "application data folder skipped"); return []; }
     }
 
     private string[] ReadPrefetch(IProgress<ScanProgress>? progress)
     {
         try { return probe.Files(Path.Combine(folders.Windows, "Prefetch"), "*.pf").ToArray(); }
-        catch (Exception error) when (IsReadError(error)) { ReportError(progress, "Prefetch skipped"); return []; }
+        catch (Exception error) when (IsReadError(error)) { ReportWarning(progress, "Prefetch skipped"); return []; }
     }
 
     private IEnumerable<string> DataRoots() => new[] { folders.RoamingData, folders.LocalData, folders.ProgramData }
@@ -412,8 +426,8 @@ public sealed class WindowsAdapter : IEvidenceAdapter
 
     private static bool IsReadError(Exception error) => error is IOException or UnauthorizedAccessException
         or SecurityException or ArgumentException or NotSupportedException;
-    private void ReportError(IProgress<ScanProgress>? progress, string stage) =>
-        progress?.Report(new(Name, stage, 0, Error: "A Windows evidence item could not be read and was skipped."));
+    private void ReportWarning(IProgress<ScanProgress>? progress, string stage) =>
+        progress?.Report(new(Name, stage, 0, Warning: "A Windows evidence item could not be read and was skipped."));
     private static string Limit(string value, int maximum) => value.Length <= maximum ? value : value[..maximum];
     private sealed record InstalledProgram(string Name, string Publisher, string Location, string InstallDate, string Icon);
 

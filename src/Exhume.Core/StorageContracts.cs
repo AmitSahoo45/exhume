@@ -6,7 +6,7 @@ public sealed record ArtifactQuery(string? Source = null, string? Kind = null,
 public sealed record CachedNarration(string CacheKey, string Json, string Model,
     string PromptVersion, DateTimeOffset CreatedAt);
 
-public sealed record ScanRecord(string Source, DateTimeOffset StartedAt, int ArtifactCount, string? Error = null);
+public sealed record ScanRecord(string Source, DateTimeOffset StartedAt, int ArtifactCount, string? Error = null, int WarningCount = 0);
 
 public sealed record StoreCounts(long Artifacts, long Narrations, long Scans);
 

@@ -20,5 +20,8 @@ public sealed class HauntCommand(CommandServices services) : AsyncCommand<HauntC
 
         [CommandOption("--report <NAME>")]
         public string? Report { get; init; }
+
+        [CommandOption("--include-untracked")]
+        public bool IncludeUntracked { get; init; }
     }
 }

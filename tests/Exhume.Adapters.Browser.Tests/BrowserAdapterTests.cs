@@ -77,13 +77,17 @@ public sealed class BrowserAdapterTests
             fixture.Visit(history, "https://example.net/", "Page", "2024-01-01", 3);
         }
         var before = File.ReadAllBytes(source);
-        using var heldOpen = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var heldOpen = new FileStream(source, FileMode.Open, FileAccess.ReadWrite, FileShare.Read);
+        heldOpen.Write(before.AsSpan(0, 1));
+        heldOpen.Flush(flushToDisk: true);
+        var written = File.GetLastWriteTimeUtc(source);
         await using (var iterator = new BrowserAdapter(fixture.Root).ScanAsync(fixture.Options).GetAsyncEnumerator())
         {
             Assert.True(await iterator.MoveNextAsync());
         }
 
-        Assert.Equal(before, File.ReadAllBytes(source));
+        Assert.Equal(before, ReadSharedBytes(source));
+        Assert.Equal(written, File.GetLastWriteTimeUtc(source));
         Assert.Empty(Directory.EnumerateFileSystemEntries(fixture.Temp));
     }
 
@@ -102,7 +106,7 @@ public sealed class BrowserAdapterTests
     }
 
     [Fact]
-    public async Task CorruptProfileIsSkippedWithSanitizedErrorAndValidProfileSurvives()
+    public async Task CorruptProfileIsSkippedWithSanitizedWarningAndValidProfileSurvives()
     {
         using var fixture = new HistoryFixture();
         using var history = fixture.Create("edge", "Default");
@@ -114,8 +118,106 @@ public sealed class BrowserAdapterTests
 
         Assert.Single(await Collect(new BrowserAdapter(fixture.Root), fixture.Options, progress));
 
-        Assert.Contains(progress.Items, x => x.Error is not null && !x.Error.Contains(fixture.Root, StringComparison.Ordinal));
+        Assert.Contains(progress.Items, x => x.Warning is not null && !x.Warning.Contains(fixture.Root, StringComparison.Ordinal));
+        Assert.DoesNotContain(progress.Items, x => x.Error is not null);
         Assert.Empty(Directory.EnumerateFileSystemEntries(fixture.Temp));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task EmptyValidHistoryContributesNoArtifactsAndDoesNotStopLaterProfiles(bool includeLaterProfile)
+    {
+        using var fixture = new HistoryFixture();
+        using var empty = fixture.Create("chrome", "Default");
+        if (includeLaterProfile)
+        {
+            using var later = fixture.Create("edge", "Default");
+            fixture.Visit(later, "https://example.com/", "Later profile", "2024-01-01", 3);
+        }
+        var progress = new CaptureProgress();
+
+        var artifacts = await Collect(new BrowserAdapter(fixture.Root), fixture.Options, progress);
+
+        Assert.Equal(includeLaterProfile ? 1 : 0, artifacts.Count);
+        Assert.DoesNotContain(progress.Items, x => x.Error is not null || x.Warning is not null);
+        Assert.Empty(Directory.EnumerateFileSystemEntries(fixture.Temp));
+    }
+
+    [Fact]
+    public async Task UnreadableHistoryOnlyReportsWholeSourceFailureWhenEveryProfileFails()
+    {
+        using var fixture = new HistoryFixture();
+        var corrupt = fixture.HistoryPath("chrome", "Default");
+        Directory.CreateDirectory(Path.GetDirectoryName(corrupt)!);
+        File.WriteAllText(corrupt, "not a database");
+        var progress = new CaptureProgress();
+
+        Assert.Empty(await Collect(new BrowserAdapter(fixture.Root), fixture.Options, progress));
+
+        Assert.Contains(progress.Items, x => x.Warning is not null);
+        Assert.Contains(progress.Items, x => x.Error is not null);
+    }
+
+    [Fact]
+    public async Task TitleMetadataKeepsReadableUnicodeAndPunctuation()
+    {
+        using var fixture = new HistoryFixture();
+        using var history = fixture.Create("chrome", "Default");
+        const string title = "Caf\u00e9 & stars \u2014 \u03bb";
+        fixture.Visit(history, "https://example.com/", title, "2024-01-01", 3);
+
+        var artifact = Assert.Single(await Collect(new BrowserAdapter(fixture.Root), fixture.Options));
+
+        Assert.Contains(title, artifact.Metadata["titles"]);
+        Assert.Equal([title], JsonSerializer.Deserialize<string[]>(artifact.Metadata["titles"])!);
+    }
+
+    [Fact]
+    public async Task SnapshotDirectoryCannotBeInsideAJunctionBackedSourceProfile()
+    {
+        using var fixture = new HistoryFixture();
+        using var history = fixture.Create("edge", "Default");
+        fixture.Visit(history, "https://example.com/", "Source", "2024-01-01", 3);
+        var source = Path.GetDirectoryName(history.DataSource)!;
+        var link = Path.GetDirectoryName(fixture.HistoryPath("chrome", "Default"))!;
+        Directory.CreateDirectory(Path.GetDirectoryName(link)!);
+        if (OperatingSystem.IsWindows())
+        {
+            var start = new System.Diagnostics.ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"))
+            {
+                UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true
+            };
+            foreach (var argument in new[] { "/c", "mklink", "/J", link, source }) start.ArgumentList.Add(argument);
+            using var process = System.Diagnostics.Process.Start(start)!;
+            await process.WaitForExitAsync();
+            Assert.True(process.ExitCode == 0, process.StandardError.ReadToEnd());
+        }
+        else Directory.CreateSymbolicLink(link, source);
+        var unsafeTemporary = Path.Combine(source, "temp");
+        try
+        {
+            Assert.Empty(await Collect(new BrowserAdapter(fixture.Root), fixture.Options with { TemporaryDirectory = unsafeTemporary }));
+            Assert.False(Directory.Exists(unsafeTemporary));
+        }
+        finally { Directory.Delete(link); }
+    }
+
+    [Fact]
+    public async Task SnapshotDirectoryCannotBeInsideAnotherDiscoveredProfile()
+    {
+        using var fixture = new HistoryFixture();
+        using var chrome = fixture.Create("chrome", "Default");
+        using var edge = fixture.Create("edge", "Default");
+        fixture.Visit(chrome, "https://example.com/", "Chrome", "2024-01-01", 3);
+        fixture.Visit(edge, "https://example.com/", "Edge", "2024-01-01", 3);
+        var unsafeTemporary = Path.Combine(Path.GetDirectoryName(edge.DataSource)!, "temp");
+        var progress = new CaptureProgress();
+
+        Assert.Empty(await Collect(new BrowserAdapter(fixture.Root), fixture.Options with { TemporaryDirectory = unsafeTemporary }, progress));
+
+        Assert.False(Directory.Exists(unsafeTemporary));
+        Assert.Contains(progress.Items, item => item.Error is not null);
     }
 
     [Fact]

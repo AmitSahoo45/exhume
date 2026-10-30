@@ -98,8 +98,8 @@ public sealed class FileSystemAdapterTests
     {
         var reader = new FakeReader
         {
-            Entries = [Entry("shortcut.txt") with { Attributes = FileAttributes.ReparsePoint },
-                Entry("loop") with { Attributes = FileAttributes.Directory | FileAttributes.ReparsePoint },
+            Entries = [Entry("shortcut.txt") with { Attributes = FileAttributes.ReparsePoint, LinkTarget = "target.txt" },
+                Entry("loop") with { Attributes = FileAttributes.Directory | FileAttributes.ReparsePoint, LinkTarget = FakeReader.Folder },
                 Entry("hidden.txt") with { Attributes = FileAttributes.Hidden },
                 Entry("system.txt") with { Attributes = FileAttributes.System }]
         };
@@ -111,16 +111,77 @@ public sealed class FileSystemAdapterTests
     }
 
     [Fact]
-    public async Task Skips_failed_directory_reports_sanitized_error_and_finishes_with_count()
+    public async Task Skips_failed_directory_reports_sanitized_warning_and_finishes_with_count()
     {
         var reader = new FakeReader { Entries = [Entry("denied") with { Attributes = FileAttributes.Directory },
             Entry("private.txt") with { Error = "File metadata was unavailable." }, Entry("kept.txt")] };
         var progress = new RecordingProgress();
         var artifacts = await Collect(new FileSystemAdapter(reader), reader.Root, progress);
         Assert.Single(artifacts);
-        Assert.Contains(progress.Values, p => p.Error is not null && !p.Error.Contains("private", StringComparison.Ordinal));
+        Assert.Contains(progress.Values, p => p.Warning is not null && !p.Warning.Contains("private", StringComparison.Ordinal));
+        Assert.DoesNotContain(progress.Values, p => p.Error is not null);
         Assert.Equal("complete", progress.Values[^1].Stage);
         Assert.Equal(1, progress.Values[^1].ItemsDone);
+    }
+
+    [Fact]
+    public async Task Cloud_reparse_files_keep_bytes_samples_and_exif_and_cloud_directories_are_walked()
+    {
+        var reader = new FakeReader
+        {
+            Entries = [Entry("cloud.jpg") with { Attributes = FileAttributes.ReparsePoint, Length = 8 },
+                Entry("cloud-folder") with { Attributes = FileAttributes.Directory | FileAttributes.ReparsePoint }],
+            ExifDateReader = _ => new DateTimeOffset(2017, 8, 9, 10, 11, 12, TimeSpan.Zero)
+        };
+        reader.Children[Path.Combine(reader.Root, "cloud-folder")] = [Entry("nested.txt")];
+        var artifacts = await Collect(new FileSystemAdapter(reader), reader.Root);
+        var photo = Assert.Single(artifacts, artifact => artifact.Name == "2017-08 photo");
+        Assert.Equal("8", photo.Metadata["bytes"]);
+        Assert.Equal("cloud.jpg", photo.Metadata["samples"]);
+        Assert.Equal("exif", photo.Metadata["dateSource"]);
+        Assert.Equal("nested.txt", Assert.Single(artifacts, artifact => artifact.Name == "2020-02 document").Metadata["samples"]);
+        Assert.Equal(2, reader.Enumerations);
+    }
+
+    [Theory]
+    [InlineData("invalid-operation")]
+    [InlineData("index-out-of-range")]
+    [InlineData("format")]
+    public async Task Unexpected_exif_failure_uses_file_dates_and_preserves_other_files(string failure)
+    {
+        var reader = new FakeReader
+        {
+            Entries = [Entry("broken.jpg"), Entry("kept.txt")],
+            ExifDateReader = _ => throw (failure switch
+            {
+                "invalid-operation" => new InvalidOperationException("private path"),
+                "index-out-of-range" => new IndexOutOfRangeException("private path"),
+                _ => new FormatException("private path")
+            })
+        };
+        var progress = new RecordingProgress();
+        var artifacts = await Collect(new FileSystemAdapter(reader), reader.Root, progress);
+        Assert.Equal(2, artifacts.Count);
+        Assert.Equal("mtime", Assert.Single(artifacts, artifact => artifact.Name == "2020-02 photo").Metadata["dateSource"]);
+        var warning = Assert.Single(progress.Values, value => value.Warning is not null);
+        Assert.DoesNotContain("private", warning.Warning!);
+        Assert.DoesNotContain(progress.Values, value => value.Error is not null);
+    }
+
+    [Fact]
+    public async Task Exif_cancellation_is_never_converted_to_a_warning()
+    {
+        var reader = new FakeReader { Entries = [Entry("cancelled.jpg")], ExifDateReader = _ => throw new OperationCanceledException() };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Collect(new FileSystemAdapter(reader), reader.Root));
+    }
+
+    [Fact]
+    public async Task Unreadable_root_remains_a_source_failure()
+    {
+        var reader = new FakeReader();
+        var progress = new RecordingProgress();
+        Assert.Empty(await Collect(new FileSystemAdapter(reader), Path.Combine(reader.Root, "missing"), progress));
+        Assert.Contains(progress.Values, value => value.Error is not null);
     }
 
     [Fact]
@@ -186,15 +247,18 @@ public sealed class FileSystemAdapterTests
         public static string Folder => Path.Combine(Path.GetTempPath(), "exhume-virtual-tree");
         public string Root => Folder;
         public List<FileEntry> Entries { get; set; } = [];
+        public Dictionary<string, List<FileEntry>> Children { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Func<string, DateTimeOffset?> ExifDateReader { get; set; } = _ => null;
         public int Enumerations { get; private set; }
         public bool DirectoryExists(string path) => path == Folder;
         public IEnumerable<FileEntry> EnumerateDirectory(string path)
         {
             Enumerations++;
+            if (Children.TryGetValue(path, out var children)) return children;
             if (path != Folder) throw new UnauthorizedAccessException("private path");
             return Entries;
         }
-        public DateTimeOffset? ReadExifDate(string path) => null;
+        public DateTimeOffset? ReadExifDate(string path) => ExifDateReader(path);
     }
 
     private sealed class RecordingProgress : IProgress<ScanProgress>

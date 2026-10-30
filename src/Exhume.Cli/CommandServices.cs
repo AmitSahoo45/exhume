@@ -22,7 +22,7 @@ public sealed partial class CommandServices(
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            WriteStorageError(settings.Home ?? "configured data directory", exception.Message);
+            WriteStorageError(exception is DataDirectoryAccessException pathError ? pathError.RequestedPath : settings.Home ?? "configured data directory", exception.Message);
             return 3;
         }
 

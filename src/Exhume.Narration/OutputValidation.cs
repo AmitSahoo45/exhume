@@ -37,9 +37,9 @@ internal static class OutputValidation
 
     internal static IReadOnlyList<HauntComment>? Haunt(JsonElement root, string file, HashSet<int> visibleLines)
     {
-        if (root.ValueKind != JsonValueKind.Array) return null;
+        if (!Fields(root, "comments") || root.GetProperty("comments").ValueKind != JsonValueKind.Array) return null;
         var comments = new List<HauntComment>();
-        foreach (var item in root.EnumerateArray())
+        foreach (var item in root.GetProperty("comments").EnumerateArray())
         {
             if (!Fields(item, "file", "lineNumber", "comment") ||
                 item.GetProperty("file").ValueKind != JsonValueKind.String ||

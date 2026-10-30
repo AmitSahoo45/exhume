@@ -8,7 +8,7 @@ using MetadataExtractor.Formats.Exif;
 namespace Exhume.Adapters.FileSystem;
 
 public sealed record FileEntry(string Path, FileAttributes Attributes, long Length,
-    DateTimeOffset? LastWriteTime, DateTimeOffset? CreationTime, string? Error = null);
+    DateTimeOffset? LastWriteTime, DateTimeOffset? CreationTime, string? Error = null, string? LinkTarget = null);
 
 public interface IFileSystemReader
 {
@@ -79,7 +79,7 @@ public sealed class FileSystemAdapter : IEvidenceAdapter
             cancellationToken.ThrowIfCancellationRequested();
             IEnumerator<FileEntry>? entries = null;
             try { entries = reader.EnumerateDirectory(directory).GetEnumerator(); }
-            catch (Exception error) when (IsReadError(error)) { ReportReadError("directory skipped"); }
+            catch (Exception error) when (IsReadError(error)) { ReportReadIssue("directory skipped", directory == root); }
             if (entries is null) continue;
             using (entries)
             {
@@ -88,12 +88,12 @@ public sealed class FileSystemAdapter : IEvidenceAdapter
                     cancellationToken.ThrowIfCancellationRequested();
                     FileEntry? entry = null;
                     try { if (entries.MoveNext()) entry = entries.Current; }
-                    catch (Exception error) when (IsReadError(error)) { ReportReadError("directory skipped"); }
+                    catch (Exception error) when (IsReadError(error)) { ReportReadIssue("directory skipped", directory == root); }
                     if (entry is null) break;
-                    if (entry.Error is not null) { ReportReadError("file skipped"); continue; }
+                    if (entry.Error is not null) { ReportReadIssue("file skipped"); continue; }
                     if ((entry.Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0) continue;
                     var isDirectory = entry.Attributes.HasFlag(FileAttributes.Directory);
-                    var isLink = entry.Attributes.HasFlag(FileAttributes.ReparsePoint);
+                    var isLink = entry.LinkTarget is not null;
                     if (isDirectory && ExcludedDirectories.Contains(Path.GetFileName(entry.Path))) continue;
                     if (isDirectory && !isLink) { pending.Push(entry.Path); continue; }
 
@@ -103,10 +103,10 @@ public sealed class FileSystemAdapter : IEvidenceAdapter
                     if (category == "photo" && !isLink && entry.Length > 0)
                     {
                         try { date = reader.ReadExifDate(entry.Path); }
-                        catch (Exception error) when (IsReadError(error) || error is ImageProcessingException or MetadataException)
+                        catch (Exception error) when (error is not OperationCanceledException)
                         {
                             progress?.Report(new(Name, "photo metadata unavailable", items,
-                                Error: "Photo metadata could not be read; filesystem dates were used."));
+                                Warning: "Photo metadata could not be read; filesystem dates were used."));
                         }
                         if (date is not null) source = "exif";
                     }
@@ -155,8 +155,9 @@ public sealed class FileSystemAdapter : IEvidenceAdapter
         }
         progress?.Report(new(Name, "complete", buckets.Count));
 
-        void ReportReadError(string stage) => progress?.Report(new(Name, stage, items,
-            Error: "An entry could not be read and was skipped."));
+        void ReportReadIssue(string stage, bool sourceFailure = false) => progress?.Report(new(Name, stage, items,
+            Error: sourceFailure ? "The root folder could not be enumerated completely." : null,
+            Warning: sourceFailure ? null : "An entry could not be read and was skipped."));
     }
 
     private static bool IsReadError(Exception error) => error is IOException or UnauthorizedAccessException
@@ -203,8 +204,9 @@ internal sealed class FileSystemReader : IFileSystemReader
             try
             {
                 var attributes = info.Attributes;
-                var length = info is FileInfo file && (attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0 ? file.Length : 0;
-                entry = new(info.FullName, attributes, length, info.LastWriteTimeUtc, info.CreationTimeUtc);
+                var linkTarget = attributes.HasFlag(FileAttributes.ReparsePoint) ? info.LinkTarget : null;
+                var length = info is FileInfo file && !attributes.HasFlag(FileAttributes.Directory) && linkTarget is null ? file.Length : 0;
+                entry = new(info.FullName, attributes, length, info.LastWriteTimeUtc, info.CreationTimeUtc, LinkTarget: linkTarget);
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException)
             {

@@ -174,6 +174,41 @@ public sealed class SqliteArtifactStoreTests : IDisposable
         Assert.False(Directory.Exists(temporaryDirectory));
     }
 
+    [Fact]
+    public async Task ForgetRemovesCorruptDatabaseWithoutOpeningIt()
+    {
+        var store = CreateStore();
+        Directory.CreateDirectory(temporaryDirectory);
+        await File.WriteAllTextAsync(store.DatabasePath, "not a database; private evidence");
+        await File.WriteAllTextAsync(store.DatabasePath + "-wal", "private journal");
+        await store.ForgetAsync();
+        Assert.False(Directory.Exists(temporaryDirectory));
+    }
+
+    [Fact]
+    public async Task ScanWarningCountsMigrateExistingStoreWithoutMarkingFailure()
+    {
+        var store = CreateStore();
+        Directory.CreateDirectory(temporaryDirectory);
+        await using (var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={store.DatabasePath};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            using var command = connection.CreateCommand();
+            command.CommandText = "CREATE TABLE scans (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, started_at TEXT NOT NULL, artifact_count INTEGER NOT NULL, error TEXT); INSERT INTO scans(source,started_at,artifact_count) VALUES ('folder','2020-01-01',2);";
+            await command.ExecuteNonQueryAsync();
+        }
+        await store.RecordScanAsync(new("folder", DateTimeOffset.UtcNow, 4, WarningCount: 3));
+        await using var check = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={store.DatabasePath};Pooling=False");
+        await check.OpenAsync();
+        using var query = check.CreateCommand();
+        query.CommandText = "SELECT SUM(warning_count), COUNT(*), COUNT(error) FROM scans;";
+        using var reader = await query.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(3, reader.GetInt32(0));
+        Assert.Equal(2, reader.GetInt32(1));
+        Assert.Equal(0, reader.GetInt32(2));
+    }
+
     public void Dispose()
     {
         string temporaryRoot = Path.GetFullPath(Path.GetTempPath());

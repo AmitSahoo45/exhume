@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using Exhume.Core;
 using Microsoft.Data.Sqlite;
@@ -9,6 +10,7 @@ namespace Exhume.Adapters.Browser;
 public sealed class BrowserAdapter(string? localApplicationData = null) : IEvidenceAdapter
 {
     private static readonly DateTimeOffset WebKitEpoch = new(1601, 1, 1, 0, 0, 0, TimeSpan.Zero);
+    private static readonly JsonSerializerOptions ReadableJson = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
     private readonly string localApplicationData = localApplicationData ?? Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
     public string Name => "browser";
 
@@ -26,22 +28,43 @@ public sealed class BrowserAdapter(string? localApplicationData = null) : IEvide
         cancellationToken.ThrowIfCancellationRequested();
         var temporaryRoot = DataDirectoryPolicy.Normalize(options.TemporaryDirectory ?? Path.Combine(".exhume", "temp"));
         var profiles = Discover(options.Profile);
+        var discoveredProfileCount = profiles.Count;
         long emitted = 0;
+        var readableProfiles = 0;
+        var unsafeTemporaryRoot = false;
+        foreach (var profile in Discover(null))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var sourceDirectory = EvidencePathResolver.Normalize(Path.GetDirectoryName(profile.History)!);
+                var prefix = Path.EndsInDirectorySeparator(sourceDirectory) ? sourceDirectory : sourceDirectory + Path.DirectorySeparatorChar;
+                if (temporaryRoot.Equals(sourceDirectory, StringComparison.OrdinalIgnoreCase) ||
+                    temporaryRoot.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) unsafeTemporaryRoot = true;
+            }
+            catch (Exception error) when (IsSourceError(error))
+            {
+                if (profiles.Remove(profile))
+                    progress?.Report(new(Name, "profile skipped", emitted, Warning: "A browser profile location could not be resolved safely."));
+            }
+        }
+        if (unsafeTemporaryRoot)
+        {
+            progress?.Report(new(Name, "complete", 0, 0, Error: "Temporary browser snapshots cannot be placed inside a source profile."));
+            yield break;
+        }
         foreach (var profile in profiles)
         {
             cancellationToken.ThrowIfCancellationRequested();
             List<Artifact> artifacts;
             try
             {
-                var sourceDirectory = Path.GetDirectoryName(profile.History)!;
-                if (temporaryRoot.Equals(sourceDirectory, StringComparison.OrdinalIgnoreCase) ||
-                    temporaryRoot.StartsWith(sourceDirectory + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
-                    throw new IOException("Temporary snapshots cannot be placed inside a source profile.");
                 artifacts = await ReadProfileAsync(profile, temporaryRoot, cancellationToken).ConfigureAwait(false);
+                readableProfiles++;
             }
             catch (Exception error) when (IsSourceError(error))
             {
-                progress?.Report(new(Name, "profile skipped", emitted, Error: "A browser history profile could not be read safely."));
+                progress?.Report(new(Name, "profile skipped", emitted, Warning: "A browser history profile could not be read safely."));
                 continue;
             }
             foreach (var artifact in artifacts)
@@ -51,7 +74,8 @@ public sealed class BrowserAdapter(string? localApplicationData = null) : IEvide
                 progress?.Report(new(Name, "aggregating", ++emitted));
             }
         }
-        progress?.Report(new(Name, "complete", emitted, emitted));
+        progress?.Report(new(Name, "complete", emitted, emitted,
+            Error: discoveredProfileCount > 0 && readableProfiles == 0 ? "No discovered browser history profile could be read safely." : null));
     }
 
     private List<Profile> Discover(string? filter)
@@ -154,7 +178,6 @@ public sealed class BrowserAdapter(string? localApplicationData = null) : IEvide
             bucket.Add(when, reader.IsDBNull(2) ? "" : reader.GetString(2));
         }
 
-        if (buckets.Count == 0) throw new InvalidDataException("No readable visits were found.");
         foreach (var item in buckets.Where(x => x.Key.Domain != "other" && x.Value.Visits < 3).ToArray())
         {
             var key = (item.Key.Month, "other");
@@ -171,7 +194,7 @@ public sealed class BrowserAdapter(string? localApplicationData = null) : IEvide
                     ["profile"] = profile.Name,
                     ["visits"] = x.Value.Visits.ToString(CultureInfo.InvariantCulture),
                     ["titles"] = JsonSerializer.Serialize(x.Value.Titles.OrderByDescending(t => t.Value).ThenBy(t => t.Key, StringComparer.Ordinal)
-                        .Take(3).Select(t => t.Key.Length > 160 ? t.Key[..160] : t.Key))
+                        .Take(3).Select(t => t.Key.Length > 160 ? t.Key[..160] : t.Key), ReadableJson)
                 })).ToList();
     }
 
@@ -184,7 +207,7 @@ public sealed class BrowserAdapter(string? localApplicationData = null) : IEvide
         return labels.Length >= 2 ? labels[^2] + "." + labels[^1] : host;
     }
 
-    private static bool IsSourceError(Exception error) => error is IOException or UnauthorizedAccessException or SqliteException or ArgumentException or InvalidOperationException;
+    private static bool IsSourceError(Exception error) => error is IOException or InvalidDataException or UnauthorizedAccessException or SqliteException or ArgumentException or InvalidOperationException;
     private sealed record Profile(string Browser, string Name, string History);
 
     private sealed class Bucket

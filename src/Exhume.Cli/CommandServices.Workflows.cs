@@ -26,20 +26,45 @@ public sealed partial class CommandServices
         foreach (var source in requested) ValidateSource(source);
         return await WithStoreAsync(settings, async (config, store) =>
         {
-            await store.InitializeAsync(cancellationToken);
             var options = new ScanOptions
             {
                 Path = settings.Path, Author = settings.Author, Profile = settings.Profile, Cutoff = settings.Cutoff,
-                Elevated = settings.Elevated, ScanRepositories = settings.ScanRepositories, TemporaryDirectory = config.TemporaryDirectory
+                Elevated = settings.Elevated, ScanRepositories = settings.ScanRepositories, TemporaryDirectory = config.TemporaryDirectory,
+                ExcludedPaths = [config.DataDirectory]
             };
+            var selectedAdapters = RegisteredAdapters.Where(adapter => requested.Length == 0 || requested.Contains(adapter.Name)).ToArray();
+            var preflightErrors = new Dictionary<IEvidenceAdapter, string>();
+            foreach (var git in selectedAdapters.OfType<IGitEvidenceReader>())
+            {
+                try
+                {
+                    if (git.Check(options).Availability == SourceAvailability.Available)
+                        ValidateRepositoryData(config, options.ScanRepositories
+                            ? EvidencePathResolver.Normalize(options.Path!)
+                            : git.GetPersonaContext(options).RepositoryPath);
+                }
+                catch (Exception exception) when (IsGitReadError(exception))
+                {
+                    preflightErrors[git] = $"Git source could not be read ({exception.GetType().Name}).";
+                }
+            }
+            await store.InitializeAsync(cancellationToken);
             var failed = false;
-            foreach (var adapter in RegisteredAdapters.Where(adapter => requested.Length == 0 || requested.Contains(adapter.Name)))
+            foreach (var adapter in selectedAdapters)
             {
                 var started = DateTimeOffset.UtcNow;
                 var committed = 0;
                 string? error = null;
+                var warnings = 0;
                 var storing = false;
                 var pending = new List<Artifact>(100);
+                if (preflightErrors.TryGetValue(adapter, out var preflightError))
+                {
+                    await store.RecordScanAsync(new(adapter.Name, started, 0, preflightError), cancellationToken);
+                    Write($"{adapter.Name}: {preflightError}");
+                    failed = true;
+                    continue;
+                }
                 try
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -54,6 +79,7 @@ public sealed partial class CommandServices
                     var progress = new InlineProgress(value =>
                     {
                         if (value.Error is not null) error ??= value.Error;
+                        if (value.Warning is not null) warnings++;
                         Write($"{value.Source}: {value.Stage} ({value.ItemsDone})");
                     });
                     await foreach (var artifact in adapter.ScanAsync(options, progress, cancellationToken).WithCancellation(cancellationToken))
@@ -85,7 +111,7 @@ public sealed partial class CommandServices
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    await store.RecordScanAsync(new(adapter.Name, started, committed, "cancelled"), CancellationToken.None);
+                    await store.RecordScanAsync(new(adapter.Name, started, committed, "cancelled", warnings), CancellationToken.None);
                     Write($"{adapter.Name}: scan cancelled; {committed} artifacts already saved.");
                     return 2;
                 }
@@ -93,9 +119,9 @@ public sealed partial class CommandServices
                 {
                     error = $"Source failed ({exception.GetType().Name}); pending artifacts were discarded.";
                 }
-                await store.RecordScanAsync(new(adapter.Name, started, committed, error), CancellationToken.None);
+                await store.RecordScanAsync(new(adapter.Name, started, committed, error, warnings), CancellationToken.None);
                 failed |= error is not null;
-                Write($"{adapter.Name}: saved {committed} artifacts" + (error is null ? "." : $"; {error}"));
+                Write($"{adapter.Name}: saved {committed} artifacts; {warnings} warning(s)" + (error is null ? "." : $"; {error}"));
             }
             return failed ? 2 : 0;
         });
@@ -109,6 +135,7 @@ public sealed partial class CommandServices
         {
             var artifacts = (await store.QueryAsync(Query(settings.Source, settings.Year), cancellationToken))
                 .Where(item => item.Kind.EndsWith("Month", StringComparison.Ordinal)).ToArray();
+            WarnRemoteNarration(config, !settings.NoModel && artifacts.Any(item => item.FirstSeen.HasValue));
             using var narrator = Narrator(config, store);
             foreach (var group in EraGroups(artifacts))
                 await RenderEraAsync(group.ToArray(), settings.NoModel, narrator, cancellationToken);
@@ -145,6 +172,7 @@ public sealed partial class CommandServices
             using var narrator = Narrator(config, store);
             if (selected is { } key)
             {
+                WarnRemoteNarration(config, !settings.NoModel);
                 foreach (var group in EraGroups(artifacts.Where(item => item.Kind.EndsWith("Month", StringComparison.Ordinal)
                     && item.FirstSeen is { } first && first.Year == key.Year && first.Month == key.Month)))
                     await RenderEraAsync(group.ToArray(), settings.NoModel, narrator, cancellationToken);
@@ -162,6 +190,7 @@ public sealed partial class CommandServices
         {
             var artifacts = (await store.QueryAsync(new(Kind: "DeadProgram"), cancellationToken))
                 .OrderByDescending(item => item.LastSeen).ThenBy(item => item.Id).Take(settings.Limit ?? 20).ToArray();
+            WarnRemoteNarration(config, !settings.NoModel && artifacts.Length > 0);
             using var narrator = Narrator(config, store);
             foreach (var artifact in artifacts)
             {
@@ -209,8 +238,26 @@ public sealed partial class CommandServices
         Write($"  evidence: {artifact.Evidence}");
     }
 
-    private NarrationService Narrator(ExhumeConfig config, IArtifactStore store) =>
-        new(config, store, Path.Combine(AppContext.BaseDirectory, "prompts"), httpHandler);
+    private NarrationService Narrator(ExhumeConfig config, IArtifactStore store, string cacheNamespace = "") =>
+        new(config, store, Path.Combine(AppContext.BaseDirectory, "prompts"), httpHandler, cacheNamespace: cacheNamespace);
+
+    private void WarnRemoteNarration(ExhumeConfig config, bool enabled)
+    {
+        if (enabled && !config.OllamaUrl.IsLoopback)
+            Write("Warning: the configured model endpoint is outside this machine; narration may send evidence to that endpoint.");
+    }
+
+    private static void ValidateRepositoryData(ExhumeConfig config, string repositoryPath)
+    {
+        var repository = Path.TrimEndingDirectorySeparator(Path.GetFullPath(repositoryPath));
+        var prefix = Path.EndsInDirectorySeparator(repository) ? repository : repository + Path.DirectorySeparatorChar;
+        if (string.Equals(repository, config.DataDirectory, StringComparison.OrdinalIgnoreCase) ||
+            config.DataDirectory.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Application data must be outside the repository working tree. Set EXHUME_HOME or --home to a separate directory.");
+    }
+
+    private static bool IsGitReadError(Exception exception) => exception is
+        IOException or UnauthorizedAccessException or InvalidDataException or LibGit2Sharp.LibGit2SharpException;
 
     private void ReportCalls(INarrationService narrator)
     {
@@ -233,7 +280,7 @@ public sealed partial class CommandServices
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or SqliteException)
         {
-            WriteStorageError(config?.DataDirectory ?? settings.Home ?? "configured data directory", exception.GetType().Name);
+            WriteStorageError(exception is DataDirectoryAccessException pathError ? pathError.RequestedPath : config?.DataDirectory ?? settings.Home ?? "configured data directory", exception.GetType().Name);
             return 3;
         }
     }

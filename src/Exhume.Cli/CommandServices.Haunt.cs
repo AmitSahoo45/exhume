@@ -20,24 +20,35 @@ public sealed partial class CommandServices
             var options = new ScanOptions
             {
                 Path = settings.Path ?? workingDirectory ?? Environment.CurrentDirectory,
-                Author = settings.Author, Cutoff = settings.Cutoff, TemporaryDirectory = config.TemporaryDirectory
+                Author = settings.Author, Cutoff = settings.Cutoff, TemporaryDirectory = config.TemporaryDirectory,
+                IncludeUntracked = settings.IncludeUntracked, ExcludedPaths = [config.DataDirectory]
             };
-            var status = reader.Check(options);
-            if (status.Availability != SourceAvailability.Available)
+            PersonaContext context;
+            try
             {
-                Write($"git: {status.Availability} - {status.Reason}");
-                return 0;
+                var status = reader.Check(options);
+                if (status.Availability != SourceAvailability.Available)
+                {
+                    Write($"git: {status.Availability} - {status.Reason}");
+                    return 0;
+                }
+                context = reader.GetPersonaContext(options);
             }
+            catch (Exception exception) when (IsGitReadError(exception))
+            {
+                Write($"git: could not read repository context ({exception.GetType().Name}).");
+                return 2;
+            }
+            ValidateRepositoryData(config, context.RepositoryPath);
             string? reportPath = settings.Report is null ? null : Path.Combine(
                 ValidateReportDirectory(Path.Combine(config.DataDirectory, "reports")), "exhume-" + settings.Report);
             if (reportPath is not null) EnsureNewFile(reportPath);
             IReadOnlyList<DiffChunk> chunks;
-            PersonaInput input;
+            PersonaInput? input = null;
             try
             {
                 chunks = await reader.ReadDiffAsync(options, cancellationToken);
                 if (chunks.Count == 0) { Write("Nothing to haunt: the working tree is clean."); return 0; }
-                input = await reader.BuildPersonaInputAsync(options, cancellationToken);
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or LibGit2Sharp.LibGit2SharpException)
             {
@@ -47,14 +58,34 @@ public sealed partial class CommandServices
 
             var report = new StringBuilder("# Exhume haunt\n\n");
             void Emit(string line) { Write(line); report.AppendLine(Escape(line)).AppendLine(); }
+            int omitted = chunks.Max(chunk => chunk.OmittedFileCount);
+            if (omitted > 0) Emit($"{omitted} changed files omitted by the file limit.");
+            var citable = chunks.Any(chunk => chunk.LineNumbers.Any(line => line > 0));
+            WarnRemoteNarration(config, !settings.NoModel && citable);
             using var narrator = Narrator(config, store);
-            var personaResult = settings.NoModel ? null : await narrator.BuildPersonaAsync(input, cancellationToken);
-            if (personaResult is NarrationSuccess<Persona> persona)
+            NarrationResult<Persona>? personaResult = null;
+            try
+            {
+                if (!settings.NoModel && citable)
+                    personaResult = await narrator.BuildPersonaAsync(context, ReadInput, cancellationToken);
+                if (citable && personaResult is not NarrationSuccess<Persona>) input ??= await ReadInput(cancellationToken);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or LibGit2Sharp.LibGit2SharpException)
+            {
+                Write($"git: could not read historical evidence ({exception.GetType().Name}).");
+                return 2;
+            }
+            if (!citable)
+            {
+                foreach (var chunk in chunks) { Emit($"{chunk.File}: no citable lines; nothing to say."); RenderChunk(chunk); }
+            }
+            else if (personaResult is NarrationSuccess<Persona> persona)
             {
                 Emit($"Past self: {persona.Value.VoiceDescription}");
                 foreach (var chunk in chunks)
                 {
                     if (chunk.Truncated) Emit($"{chunk.File}: diff truncated; review covers only the displayed excerpt.");
+                    if (!chunk.LineNumbers.Any(line => line > 0)) { Emit($"{chunk.File}: no citable lines; nothing to say."); continue; }
                     var result = await narrator.HauntAsync(persona.Value, chunk, cancellationToken);
                     if (result is NarrationSuccess<IReadOnlyList<HauntComment>> comments)
                     {
@@ -71,7 +102,7 @@ public sealed partial class CommandServices
             else
             {
                 if (!settings.NoModel) Emit("Narration unavailable; showing raw evidence.");
-                Emit($"Author: {input.Author}; before: {input.Cutoff:yyyy-MM-dd}; commits: {input.TotalCommitCount}");
+                Emit($"Author: {input!.Author}; before: {input.Cutoff:yyyy-MM-dd}; commits: {input.TotalCommitCount}");
                 foreach (var subject in input.CommitSubjects) Emit(subject);
                 foreach (var chunk in chunks) RenderChunk(chunk);
             }
@@ -82,6 +113,8 @@ public sealed partial class CommandServices
             }
             ReportCalls(narrator);
             return 0;
+
+            async Task<PersonaInput> ReadInput(CancellationToken token) => input ??= await reader.BuildPersonaInputAsync(options, token);
 
             void RenderChunk(DiffChunk chunk)
             {

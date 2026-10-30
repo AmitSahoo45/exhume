@@ -131,13 +131,14 @@ public sealed class SqliteArtifactStore : IArtifactStore
         await using var connection = await OpenConnectionAsync(cancellationToken);
         using var command = connection.CreateCommand();
         command.CommandText = """
-            INSERT INTO scans (source, started_at, artifact_count, error)
-            VALUES ($source, $started, $count, $error);
+            INSERT INTO scans (source, started_at, artifact_count, error, warning_count)
+            VALUES ($source, $started, $count, $error, $warnings);
             """;
         Add(command, "$source", scan.Source);
         Add(command, "$started", FormatTimestamp(scan.StartedAt));
         Add(command, "$count", scan.ArtifactCount);
         Add(command, "$error", scan.Error);
+        Add(command, "$warnings", scan.WarningCount);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
@@ -151,28 +152,17 @@ public sealed class SqliteArtifactStore : IArtifactStore
         return new StoreCounts(reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2));
     }
 
-    public async Task ForgetAsync(CancellationToken cancellationToken = default)
+    public Task ForgetAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ValidateDirectory();
         if (!Directory.Exists(dataDirectory))
         {
-            return;
+            return Task.CompletedTask;
         }
 
         if (File.Exists(DatabasePath))
         {
-            await using (var connection = await OpenConnectionAsync(cancellationToken))
-            {
-                using var transaction = connection.BeginTransaction();
-                using var command = connection.CreateCommand();
-                command.Transaction = transaction;
-                command.CommandText = "DELETE FROM artifacts; DELETE FROM narrations; DELETE FROM scans;";
-                await command.ExecuteNonQueryAsync(cancellationToken);
-                cancellationToken.ThrowIfCancellationRequested();
-                transaction.Commit();
-            }
-
             ValidateDirectory();
             File.Delete(DatabasePath);
         }
@@ -186,6 +176,7 @@ public sealed class SqliteArtifactStore : IArtifactStore
         {
             Directory.Delete(dataDirectory);
         }
+        return Task.CompletedTask;
     }
 
     private async Task<SqliteConnection> OpenConnectionAsync(CancellationToken cancellationToken)
@@ -230,10 +221,23 @@ public sealed class SqliteArtifactStore : IArtifactStore
                     source TEXT NOT NULL,
                     started_at TEXT NOT NULL,
                     artifact_count INTEGER NOT NULL,
-                    error TEXT
+                    error TEXT,
+                    warning_count INTEGER NOT NULL DEFAULT 0
                 );
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken);
+            using (var migration = connection.BeginTransaction())
+            {
+                command.Transaction = migration;
+                command.CommandText = "SELECT COUNT(*) FROM pragma_table_info('scans') WHERE name = 'warning_count';";
+                if (Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture) == 0)
+                {
+                    command.CommandText = "ALTER TABLE scans ADD COLUMN warning_count INTEGER NOT NULL DEFAULT 0;";
+                    await command.ExecuteNonQueryAsync(cancellationToken);
+                }
+                migration.Commit();
+                command.Transaction = null;
+            }
             return connection;
         }
         catch

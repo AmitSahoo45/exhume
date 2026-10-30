@@ -175,7 +175,7 @@ public sealed class WorkflowTests : IDisposable
     {
         await Store().UpsertAsync([Item("folder", "one", new() { ["samples"] = "private-note.txt | personal-photo.jpg" })]);
         var path = Path.Combine(root, "report.md");
-        Assert.Equal(0, await Host([]).RunAsync(["export", "--path", path, "--redact", "--home", Data]));
+        Assert.Equal(0, await Host([]).RunAsync(["export", "--path", path, "--redact", "--no-model", "--home", Data]));
         var report = await File.ReadAllTextAsync(path);
         Assert.Contains(".txt", report);
         Assert.Contains(".jpg", report);

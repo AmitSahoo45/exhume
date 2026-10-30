@@ -18,13 +18,19 @@ public sealed class GitAdapter : IGitEvidenceReader
     private static readonly LibGit2Sharp.CompareOptions Comparison = new() { Similarity = SimilarityOptions.None, ContextLines = 3 };
     public string Name => "git";
 
+    public PersonaContext GetPersonaContext(ScanOptions options)
+    {
+        using var repository = OpenRepository(RequiredPath(options));
+        return Context(repository, options);
+    }
+
     public SourceStatus Check(ScanOptions options)
     {
         foreach (var path in Discover(options))
         {
             try
             {
-                using var repository = new Repository(path);
+                using var repository = OpenRepository(path);
                 if (Author(repository, options) is not null)
                     return new(SourceAvailability.Available, "A local repository and author email are available.");
             }
@@ -38,20 +44,28 @@ public sealed class GitAdapter : IGitEvidenceReader
     {
         cancellationToken.ThrowIfCancellationRequested();
         long emitted = 0;
-        foreach (var path in Discover(options))
+        var repositories = Discover(options);
+        var readableRepositories = 0;
+        foreach (var path in repositories)
         {
             cancellationToken.ThrowIfCancellationRequested();
             await Task.Yield();
             List<Artifact> artifacts;
             try
             {
-                using var repository = new Repository(path);
-                var author = Author(repository, options) ?? throw new InvalidDataException("Author email is missing.");
-                artifacts = ReadMonths(repository, path, author, progress, cancellationToken);
+                using var repository = OpenRepository(path);
+                var author = Author(repository, options);
+                if (author is null)
+                {
+                    progress?.Report(new(Name, "repository skipped", emitted, Warning: "A repository has no configured author email; supply --author to include it."));
+                    continue;
+                }
+                artifacts = ReadMonths(repository, WorkingTreePath(repository), author, progress, cancellationToken);
+                readableRepositories++;
             }
             catch (Exception error) when (IsSourceError(error))
             {
-                progress?.Report(new(Name, "repository skipped", emitted, Error: "A repository could not be read or has no author email."));
+                progress?.Report(new(Name, "repository skipped", emitted, Warning: "A repository could not be read safely."));
                 continue;
             }
             foreach (var artifact in artifacts)
@@ -61,16 +75,16 @@ public sealed class GitAdapter : IGitEvidenceReader
                 progress?.Report(new(Name, "aggregating", ++emitted));
             }
         }
-        progress?.Report(new(Name, "complete", emitted, emitted));
+        progress?.Report(new(Name, "complete", emitted, emitted,
+            Error: repositories.Count > 0 && readableRepositories == 0 ? "No discovered repository could be scanned." : null));
     }
 
     public Task<PersonaInput> BuildPersonaInputAsync(ScanOptions options, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var path = RequiredPath(options);
-        using var repository = new Repository(path);
-        var author = Author(repository, options) ?? throw new InvalidDataException("Supply an author email or configure user.email.");
-        var cutoff = (options.Cutoff ?? new DateTimeOffset(DateTime.UtcNow.Date, TimeSpan.Zero).AddMonths(-18)).ToUniversalTime();
+        using var repository = OpenRepository(RequiredPath(options));
+        var context = Context(repository, options);
+        var (path, author, cutoff) = context;
         var commits = Commits(repository, author, cancellationToken).Where(x => x.Author.When < cutoff).ToArray();
         var languages = new Dictionary<string, int>(StringComparer.Ordinal);
         var hours = new Dictionary<int, int>();
@@ -102,28 +116,35 @@ public sealed class GitAdapter : IGitEvidenceReader
     public Task<IReadOnlyList<DiffChunk>> ReadDiffAsync(ScanOptions options, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var path = RequiredPath(options);
-        using var repository = new Repository(path);
+        using var repository = OpenRepository(RequiredPath(options));
         if (repository.Info.IsBare) return Task.FromResult<IReadOnlyList<DiffChunk>>([]);
+        var root = WorkingTreePath(repository);
+        var excluded = options.ExcludedPaths.Select(path => EvidencePathResolver.Normalize(Path.GetFullPath(path, root))).ToArray();
         var head = repository.Head.Tip?.Tree;
         using var changes = repository.Diff.Compare<TreeChanges>(head, DiffTargets.Index | DiffTargets.WorkingDirectory,
             null, null, Comparison);
-        var tracked = changes.ToDictionary(x => x.Path, StringComparer.Ordinal);
-        var statuses = repository.RetrieveStatus(new StatusOptions
+        var tracked = changes.Where(change => (head?[change.Path] is not null || repository.Index[change.Path] is not null) &&
+            !IsExcluded(root, change.Path, excluded)).ToDictionary(x => x.Path, StringComparer.Ordinal);
+        IEnumerable<string> untracked = [];
+        if (options.IncludeUntracked)
         {
-            IncludeUntracked = true, RecurseUntrackedDirs = true,
-            DetectRenamesInIndex = false, DetectRenamesInWorkDir = false
-        });
-        var paths = tracked.Keys.Concat(statuses.Where(x => x.State.HasFlag(FileStatus.NewInWorkdir)).Select(x => x.FilePath))
-            .Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+            var statuses = repository.RetrieveStatus(new StatusOptions
+            {
+                IncludeUntracked = true, RecurseUntrackedDirs = true,
+                DetectRenamesInIndex = false, DetectRenamesInWorkDir = false
+            });
+            untracked = statuses.Where(entry => entry.State.HasFlag(FileStatus.NewInWorkdir) && !IsExcluded(root, entry.FilePath, excluded))
+                .Select(entry => entry.FilePath).Order(StringComparer.Ordinal);
+        }
+        var paths = tracked.Keys.Order(StringComparer.Ordinal).Concat(untracked).Distinct(StringComparer.Ordinal).ToArray();
         var chunks = new List<DiffChunk>();
         foreach (var file in paths.Take(MaximumFiles))
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                var fullPath = Path.GetFullPath(Path.Combine(repository.Info.WorkingDirectory, file));
-                if (!SafeWorkingPath(repository.Info.WorkingDirectory, fullPath))
+                var fullPath = Path.GetFullPath(Path.Combine(root, file));
+                if (!SafeWorkingPath(root, fullPath))
                 {
                     chunks.Add(new(file, "Linked file content omitted.", [], true));
                     continue;
@@ -151,8 +172,9 @@ public sealed class GitAdapter : IGitEvidenceReader
                 chunks.Add(new(file, "Diff unavailable for this file.", [], true));
             }
         }
-        if (paths.Length > MaximumFiles && chunks.Count > 0)
-            chunks[^1] = chunks[^1] with { Truncated = true };
+        if (paths.Length > MaximumFiles)
+            for (var index = 0; index < chunks.Count; index++)
+                chunks[index] = chunks[index] with { Truncated = true, OmittedFileCount = paths.Length - MaximumFiles };
         return Task.FromResult<IReadOnlyList<DiffChunk>>(chunks);
     }
 
@@ -183,7 +205,7 @@ public sealed class GitAdapter : IGitEvidenceReader
             }
             catch (Exception error) when (IsSourceError(error))
             {
-                progress?.Report(new("git", "commit diff skipped", examined, Error: "A historical commit diff could not be read."));
+                progress?.Report(new("git", "commit diff skipped", examined, Warning: "A historical commit diff could not be read."));
             }
             progress?.Report(new("git", "reading commits", ++examined));
         }
@@ -289,7 +311,33 @@ public sealed class GitAdapter : IGitEvidenceReader
     private static string? Author(Repository repository, ScanOptions options)
     {
         var author = string.IsNullOrWhiteSpace(options.Author) ? repository.Config.Get<string>("user.email")?.Value : options.Author;
-        return string.IsNullOrWhiteSpace(author) ? null : author.Trim();
+        return string.IsNullOrWhiteSpace(author) ? null : author.Trim().ToLowerInvariant();
+    }
+
+    private static PersonaContext Context(Repository repository, ScanOptions options) => new(
+        WorkingTreePath(repository),
+        Author(repository, options) ?? throw new InvalidDataException("Supply an author email or configure user.email."),
+        (options.Cutoff ?? new DateTimeOffset(DateTime.UtcNow.Date, TimeSpan.Zero).AddMonths(-18)).ToUniversalTime());
+
+    private static Repository OpenRepository(string path)
+    {
+        var canonical = EvidencePathResolver.Normalize(path);
+        if (File.Exists(canonical) && string.Equals(Path.GetFileName(canonical), ".git", StringComparison.OrdinalIgnoreCase))
+            canonical = Path.GetDirectoryName(canonical)!;
+        var discovered = Repository.Discover(canonical) ?? throw new InvalidDataException("A local repository could not be found.");
+        return new Repository(discovered);
+    }
+
+    private static string WorkingTreePath(Repository repository) =>
+        EvidencePathResolver.Normalize(repository.Info.IsBare ? repository.Info.Path : repository.Info.WorkingDirectory);
+
+    private static bool IsExcluded(string root, string relativePath, IReadOnlyList<string> excluded)
+    {
+        if (excluded.Count == 0) return false;
+        var fullPath = EvidencePathResolver.Normalize(Path.Combine(root, relativePath));
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        return excluded.Any(path => fullPath.Equals(path, comparison) ||
+            fullPath.StartsWith(path + Path.DirectorySeparatorChar, comparison));
     }
 
     private static string RequiredPath(ScanOptions options)
@@ -333,7 +381,7 @@ public sealed class GitAdapter : IGitEvidenceReader
     private static string Subject(string text) => text.Length > 160 ? text[..160] : text;
     private static string Extension(string file) => Path.GetExtension(file).ToLowerInvariant() is { Length: > 0 } extension ? extension : "other";
     private static void AddCount<TKey>(Dictionary<TKey, int> counts, TKey key) where TKey : notnull => counts[key] = counts.GetValueOrDefault(key) + 1;
-    private static bool IsSourceError(Exception error) => error is LibGit2SharpException or IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException;
+    private static bool IsSourceError(Exception error) => error is LibGit2SharpException or IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException or InvalidOperationException;
 
     private sealed class MonthBucket
     {

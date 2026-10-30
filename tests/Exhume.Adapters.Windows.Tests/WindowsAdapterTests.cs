@@ -49,7 +49,10 @@ public sealed class WindowsAdapterTests
         f.Registry.Add(WindowsAdapter.UserAssist + @"\counter\Count", (WindowsAdapter.DecodeRot13(raw), UserAssistValue(5, Past)));
         var progress = new RecordingProgress();
         Assert.Empty(await Collect(f.Adapter, progress: progress));
-        Assert.Contains(progress.Values, value => value.Stage.Contains("unresolved", StringComparison.OrdinalIgnoreCase));
+        var warning = Assert.Single(progress.Values, value => value.Warning is not null);
+        Assert.Contains("unresolved", warning.Stage, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(raw, warning.Warning!);
+        Assert.DoesNotContain(progress.Values, value => value.Error is not null);
     }
 
     [Fact]
@@ -175,7 +178,8 @@ public sealed class WindowsAdapterTests
         Assert.Equal(SourceAvailability.Available, f.Adapter.Check(new() { Elevated = true }).Availability);
         var progress = new RecordingProgress();
         Assert.Single(await Collect(f.Adapter, new() { Elevated = true }, progress));
-        Assert.Contains(progress.Values, p => p.Error is not null && p.Stage.Contains("Prefetch", StringComparison.Ordinal));
+        Assert.Contains(progress.Values, p => p.Warning is not null && p.Stage.Contains("Prefetch", StringComparison.Ordinal));
+        Assert.DoesNotContain(progress.Values, p => p.Error is not null);
     }
 
     [Fact]
@@ -190,6 +194,37 @@ public sealed class WindowsAdapterTests
         Assert.Empty(await Collect(f.Adapter, new() { Elevated = true }));
     }
 
+    [Theory]
+    [InlineData(@"D:\Windows\System32", "SVCHOST.EXE")]
+    [InlineData(@"D:\Windows\SysWOW64", "DLLHOST.EXE")]
+    [InlineData(@"D:\Windows", "EXPLORER.EXE")]
+    [InlineData(@"D:\Apps\Installed", "HELPER.EXE")]
+    public async Task Prefetch_probes_system_and_known_installation_directories_before_classifying(string directory, string executable)
+    {
+        var f = Fixture();
+        f.Registry.Add(WindowsAdapter.UninstallUser, subKeys: ["live"]);
+        f.Registry.Add(WindowsAdapter.UninstallUser + @"\live", ("DisplayName", "Different product name"),
+            ("InstallLocation", @"D:\Apps\Installed"));
+        f.Probe.ExistingFiles.Add(Path.Combine(directory, executable));
+        var prefetch = Path.Combine(Folders.Windows, "Prefetch");
+        f.Probe.FileChildren[prefetch] = [Path.Combine(prefetch, executable + "-12AB34CD.pf")];
+        Assert.Empty(await Collect(f.Adapter, new() { Elevated = true }));
+    }
+
+    [Fact]
+    public async Task Unreadable_Prefetch_living_probe_is_a_warning_and_never_a_false_death()
+    {
+        var f = Fixture();
+        var prefetch = Path.Combine(Folders.Windows, "Prefetch");
+        f.Probe.FileChildren[prefetch] = [Path.Combine(prefetch, "UNCERTAIN.EXE-12AB34CD.pf")];
+        f.Probe.Denied.Add(Path.Combine(Folders.System32, "UNCERTAIN.EXE"));
+        f.Registry.Add(WindowsAdapter.AppCompat, (@"D:\Gone\kept.exe", new byte[0]));
+        var progress = new RecordingProgress();
+        Assert.Equal("kept", Assert.Single(await Collect(f.Adapter, new() { Elevated = true }, progress)).Name);
+        Assert.Contains(progress.Values, value => value.Warning is not null);
+        Assert.DoesNotContain(progress.Values, value => value.Error is not null);
+    }
+
     [Fact]
     public async Task Bad_registry_item_or_disk_probe_error_is_skipped_and_cancellation_propagates()
     {
@@ -198,7 +233,8 @@ public sealed class WindowsAdapterTests
         f.Probe.Denied.Add(@"D:\private\denied.exe");
         var progress = new RecordingProgress();
         Assert.Single(await Collect(f.Adapter, progress: progress));
-        Assert.Contains(progress.Values, p => p.Error is not null && !p.Error.Contains("private", StringComparison.Ordinal));
+        Assert.Contains(progress.Values, p => p.Warning is not null && !p.Warning.Contains("private", StringComparison.Ordinal));
+        Assert.DoesNotContain(progress.Values, p => p.Error is not null);
         Assert.Equal("complete", progress.Values[^1].Stage);
         using var cancelled = new CancellationTokenSource();
         cancelled.Cancel();

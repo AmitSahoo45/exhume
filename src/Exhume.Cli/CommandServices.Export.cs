@@ -12,25 +12,36 @@ public sealed partial class CommandServices
     public Task<int> RunExportAsync(ExportCommand.Settings settings, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(settings.Path)) throw new ArgumentException("export requires --path.");
-        var path = Path.GetFullPath(settings.Path, workingDirectory ?? Environment.CurrentDirectory);
-        var parent = DataDirectoryPolicy.Normalize(Path.GetDirectoryName(path)!);
-        path = Path.Combine(parent, Path.GetFileName(path));
-        EnsureNewFile(path);
         return WithStoreAsync(settings, async (config, store) =>
         {
-            var artifacts = await store.QueryAsync(cancellationToken: cancellationToken);
+            string path;
+            try
+            {
+                path = Path.GetFullPath(settings.Path, workingDirectory ?? Environment.CurrentDirectory);
+                var parent = DataDirectoryPolicy.Normalize(Path.GetDirectoryName(path)!);
+                path = Path.Combine(parent, Path.GetFileName(path));
+                EnsureNewFile(path);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                Write($"Export destination is unavailable: {settings.Path}. Choose a writable report path.");
+                return 3;
+            }
+            var original = await store.QueryAsync(cancellationToken: cancellationToken);
+            IReadOnlyList<Artifact> artifacts = settings.Redact ? original.Select(RedactArtifact).ToArray() : original;
             var report = new StringBuilder("# Exhume\n\nDig up what your machine remembers.\n\n");
-            report.AppendLine(settings.Redact ? "Redacted export: private titles, file samples, evidence paths and generated narration are omitted.\n" : "Local evidence report.\n");
+            report.AppendLine(settings.Redact ? "Redacted export: private titles and paths are omitted, file samples retain only extensions, and narration uses sanitized evidence.\n" : "Local evidence report.\n");
             report.AppendLine("## Timeline\n\n| Month | Source | Artifacts |\n|---|---|---|");
             foreach (var month in Timeline.GroupByMonth(artifacts))
                 foreach (var group in month.Value.GroupBy(item => item.Source))
                     report.AppendLine($"| {month.Key.Year:D4}-{month.Key.Month:D2} | {Escape(group.Key)} | {group.Count()} |");
-            using var narrator = Narrator(config, store);
+            WarnRemoteNarration(config, !settings.NoModel && artifacts.Count > 0);
+            using var narrator = Narrator(config, store, settings.Redact ? "redacted-v1" : "");
             report.AppendLine("\n## Obituaries\n");
             foreach (var artifact in artifacts.Where(item => item.Kind == "DeadProgram").OrderByDescending(item => item.LastSeen))
             {
                 AppendArtifact(report, artifact, settings.Redact);
-                if (!settings.NoModel && !settings.Redact)
+                if (!settings.NoModel)
                 {
                     if (await narrator.NarrateObituaryAsync(artifact, cancellationToken) is NarrationSuccess<Obituary> obituary)
                         report.AppendLine($"{Escape(obituary.Value.Headline)}\n\n{Escape(obituary.Value.Body)}\n\n{Escape(obituary.Value.CauseOfDeath)}\n\n{Escape(obituary.Value.Epitaph)}\n");
@@ -42,7 +53,7 @@ public sealed partial class CommandServices
             {
                 report.AppendLine($"### {group.Key.Year:D4}-{group.Key.Month:D2} · {Escape(group.Key.Source)}\n");
                 foreach (var artifact in group) AppendArtifact(report, artifact, settings.Redact);
-                if (!settings.NoModel && !settings.Redact)
+                if (!settings.NoModel)
                 {
                     if (await narrator.NarrateEraAsync(group.ToArray(), cancellationToken) is NarrationSuccess<EraSummary> era)
                         report.AppendLine($"{Escape(era.Value.Title)}\n\n{Escape(era.Value.Body)}\n\nThemes: {Escape(string.Join(", ", era.Value.Themes))}\n");
@@ -55,7 +66,12 @@ public sealed partial class CommandServices
                 report.AppendLine("\n## Undated evidence\n");
                 foreach (var artifact in undated) AppendArtifact(report, artifact, settings.Redact);
             }
-            await WriteReportAsync(path, report.ToString(), cancellationToken);
+            try { await WriteReportAsync(path, report.ToString(), cancellationToken); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                Write($"Export destination is not writable: {path}. Choose a writable report path.");
+                return 3;
+            }
             Write($"Exported report: {path}");
             ReportCalls(narrator);
             return 0;
@@ -82,12 +98,19 @@ public sealed partial class CommandServices
             }
             cancellationToken.ThrowIfCancellationRequested();
             await store.ForgetAsync(cancellationToken);
-            foreach (var directoryName in new[] { "temp", "reports" })
+            foreach (var directoryName in new[] { "temp", "reports", "logs" })
             {
                 var directory = Path.Combine(config.DataDirectory, directoryName);
                 if (!Directory.Exists(directory) || new DirectoryInfo(directory).LinkTarget is not null) continue;
                 var canonical = DataDirectoryPolicy.Normalize(directory);
                 if (!string.Equals(canonical, directory, StringComparison.OrdinalIgnoreCase)) continue;
+                if (directoryName == "logs")
+                {
+                    var log = Path.Combine(directory, "narration.jsonl");
+                    if (File.Exists(log) && new FileInfo(log).LinkTarget is null) File.Delete(log);
+                    if (!Directory.EnumerateFileSystemEntries(directory).Any()) Directory.Delete(directory);
+                    continue;
+                }
                 foreach (var file in Directory.EnumerateFiles(directory, "exhume-*.md", SearchOption.TopDirectoryOnly))
                     if (new FileInfo(file).LinkTarget is null) File.Delete(file);
                 foreach (var file in Directory.EnumerateFiles(directory, ".exhume-write-*.tmp", SearchOption.TopDirectoryOnly))
@@ -129,9 +152,31 @@ public sealed partial class CommandServices
         {
             var names = value.TrimStart().StartsWith('[') ? JsonSerializer.Deserialize<string[]>(value) ?? []
                 : value.Split(" | ", StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            return string.Join(", ", names.Select(Path.GetExtension).Where(extension => !string.IsNullOrEmpty(extension)).Distinct());
+            return string.Join(", ", names.Select(Path.GetExtension).Where(extension => extension is not null &&
+                System.Text.RegularExpressions.Regex.IsMatch(extension, @"\A\.[A-Za-z0-9]{1,10}\z")).Distinct(StringComparer.OrdinalIgnoreCase));
         }
         catch (JsonException) { return "[redacted]"; }
+    }
+
+    private static Artifact RedactArtifact(Artifact original)
+    {
+        var metadata = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var pair in original.Metadata)
+        {
+            if (pair.Key == "samples")
+                metadata[pair.Key] = JsonSerializer.Serialize(RedactSamples(pair.Value).Split(", ", StringSplitOptions.RemoveEmptyEntries));
+            else if (pair.Key is "count" or "bytes" or "visits" or "commits" or "filesTouched" or "runCount")
+            {
+                if (long.TryParse(pair.Value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var count) && count >= 0)
+                    metadata[pair.Key] = count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+            else if (pair.Key == "confidence" && pair.Value is "high" or "low") metadata[pair.Key] = pair.Value;
+            else if (pair.Key == "dateSource" && pair.Value is "exif" or "mtime" or "ctime") metadata[pair.Key] = pair.Value;
+            else if (pair.Key == "browser" && pair.Value is "chrome" or "edge" or "brave") metadata[pair.Key] = pair.Value;
+            else if (pair.Key is "titles" or "exePath" or "messages" or "installedSiblings" or "profile") metadata[pair.Key] = "[redacted]";
+        }
+        var name = original.Source == "git" ? $"{original.FirstSeen:yyyy-MM} repository activity" : original.Name;
+        return new(original.Source, original.Kind, original.Id, name, original.FirstSeen, original.LastSeen, "", metadata);
     }
 
     private static void CleanHistorySnapshots(string temporaryRoot)

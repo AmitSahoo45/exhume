@@ -14,6 +14,7 @@ public sealed class HauntWorkflowTests : IDisposable
     private readonly FakeGit git = new();
     private readonly Handler http = new();
     private string Data => Path.Combine(root, "data");
+    private string RepositoryPath => Path.Combine(root, "repository");
 
     private static string CreateRoot() => Directory.CreateDirectory(DataDirectoryPolicy.Normalize(
         Path.Combine(Path.GetTempPath(), "exhume-haunt-flow-" + Guid.NewGuid().ToString("N")))).FullName;
@@ -38,15 +39,75 @@ public sealed class HauntWorkflowTests : IDisposable
         Assert.Equal(0, http.Calls);
     }
 
+    [Theory]
+    [InlineData("haunt")]
+    [InlineData("dig")]
+    public async Task RepositoryCannotContainTheApplicationDataDirectory(string command)
+    {
+        git.RepositoryPath = root;
+        var args = command == "haunt"
+            ? new[] { "haunt", "--path", root, "--home", Data, "--no-model" }
+            : new[] { "dig", "--source", "git", "--path", root, "--home", Data };
+        Assert.Equal(1, await Host().RunAsync(args));
+        Assert.Contains("EXHUME_HOME", output.ToString());
+        Assert.False(Directory.Exists(Data));
+        Assert.Equal(0, git.PersonaReads);
+        Assert.Equal(0, http.Calls);
+    }
+
+    [Theory]
+    [InlineData("haunt")]
+    [InlineData("dig")]
+    public async Task RepositoryContextReadFailureHasASourceExitWithoutEscaping(string command)
+    {
+        git.ContextFailure = new LibGit2Sharp.LibGit2SharpException("synthetic source became unreadable");
+        var args = command == "haunt"
+            ? new[] { "haunt", "--path", RepositoryPath, "--home", Data, "--no-model" }
+            : new[] { "dig", "--source", "git", "--path", RepositoryPath, "--home", Data };
+        Assert.Equal(2, await Host().RunAsync(args));
+        Assert.Contains("git", output.ToString());
+        Assert.DoesNotContain("Data directory is not writable", output.ToString());
+        Assert.Equal(0, http.Calls);
+    }
+
+    [Fact]
+    public async Task RepositoryAtDriveRootStillRejectsContainedApplicationData()
+    {
+        git.RepositoryPath = Path.GetPathRoot(root)!;
+        Assert.Equal(1, await Host().RunAsync(["haunt", "--path", git.RepositoryPath, "--home", Data, "--no-model"]));
+        Assert.False(Directory.Exists(Data));
+    }
+
+    [Fact]
+    public async Task UncitableDiffDoesNotBuildPersonaOrCallModel()
+    {
+        git.Chunks = [new("deleted.txt", "-removed", [], true)];
+        Assert.Equal(0, await Host().RunAsync(["haunt", "--path", RepositoryPath, "--home", Data]));
+        Assert.Contains("no citable lines", output.ToString());
+        Assert.Equal(0, git.PersonaReads);
+        Assert.Equal(0, http.Calls);
+    }
+
+    [Fact]
+    public async Task HauntReportsGlobalFileOmissionsAndPassesUntrackedOptIn()
+    {
+        git.Chunks = [new("sample.txt", "+new line", [1], true, 7)];
+        Assert.Equal(0, await Host().RunAsync(["haunt", "--path", RepositoryPath, "--home", Data, "--include-untracked", "--no-model"]));
+        Assert.True(git.LastOptions!.IncludeUntracked);
+        Assert.Contains(Data, git.LastOptions.ExcludedPaths);
+        Assert.Contains("7 changed files omitted", output.ToString());
+    }
+
     [Fact]
     public async Task NarratedHauntUsesCacheAndRendersOnlyValidatedComments()
     {
         http.Responses.Enqueue("""{"voiceDescription":"Dry","habits":["small changes"],"petPhrases":[],"thingsToNitpick":[],"technicalWorldview":"Keep it clear"}""");
-        http.Responses.Enqueue("""[{"file":"sample.txt","lineNumber":1,"comment":"Check this line."}]""");
+        http.Responses.Enqueue("""{"comments":[{"file":"sample.txt","lineNumber":1,"comment":"Check this line."}]}""");
         var host = Host();
         Assert.Equal(0, await host.RunAsync(["haunt", "--path", root, "--home", Data]));
         Assert.Equal(0, await host.RunAsync(["haunt", "--path", root, "--home", Data]));
         Assert.Equal(2, http.Calls);
+        Assert.Equal(1, git.PersonaReads);
         Assert.Contains("sample.txt:1", output.ToString());
         Assert.Contains("Check this line.", output.ToString());
         Assert.Contains("Narration calls: 0", output.ToString());
@@ -94,6 +155,7 @@ public sealed class HauntWorkflowTests : IDisposable
 
     private CliHost Host()
     {
+        git.RepositoryPath ??= RepositoryPath;
         var console = AnsiConsole.Create(new AnsiConsoleSettings
         {
             Ansi = AnsiSupport.No, ColorSystem = ColorSystemSupport.NoColors, Interactive = InteractionSupport.No,
@@ -127,17 +189,25 @@ public sealed class HauntWorkflowTests : IDisposable
 
     private sealed class FakeGit : IGitEvidenceReader
     {
+        public string? RepositoryPath { get; set; }
+        public Exception? ContextFailure { get; set; }
+        public PersonaContext GetPersonaContext(ScanOptions options) => ContextFailure is { } error ? throw error
+            : new(RepositoryPath ?? options.Path!, "owner@example.test", new(2020,1,1,0,0,0,TimeSpan.Zero));
         public string Name => "git";
         public int PersonaReads { get; private set; }
+        public ScanOptions? LastOptions { get; private set; }
         public IReadOnlyList<DiffChunk> Chunks { get; set; } =
             [new("sample.txt", "@@ -1,1 +1,1 @@\n-old line\n+new line\n", [1])];
         public SourceStatus Check(ScanOptions options) => new(SourceAvailability.Available, "fixture");
-        public Task<IReadOnlyList<DiffChunk>> ReadDiffAsync(ScanOptions options, CancellationToken cancellationToken = default) =>
-            Task.FromResult(Chunks);
+        public Task<IReadOnlyList<DiffChunk>> ReadDiffAsync(ScanOptions options, CancellationToken cancellationToken = default)
+        {
+            LastOptions = options;
+            return Task.FromResult(Chunks);
+        }
         public Task<PersonaInput> BuildPersonaInputAsync(ScanOptions options, CancellationToken cancellationToken = default)
         {
             PersonaReads++;
-            return Task.FromResult(new PersonaInput(options.Path!, "owner@example.test", new(2020,1,1,0,0,0,TimeSpan.Zero),
+            return Task.FromResult(new PersonaInput(RepositoryPath ?? options.Path!, "owner@example.test", new(2020,1,1,0,0,0,TimeSpan.Zero),
                 1, ["old subject"], [], new Dictionary<string,int> { [".txt"] = 1 }, new Dictionary<int,int> { [12] = 1 }));
         }
         public async IAsyncEnumerable<Artifact> ScanAsync(ScanOptions options, IProgress<ScanProgress>? progress = null,

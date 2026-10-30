@@ -85,14 +85,16 @@ All eight commands accept the shared configuration options listed below.
 | `timeline` | Monthly artifact counts; optionally open a month | `--source`, `--year`, `--month YYYY-MM`, `--no-model` |
 | `obituaries` | Program evidence and obituaries | `--limit` (default 20), `--no-model` |
 | `eras` | Monthly browser, folder, or repository summaries | `--source`, `--year`, `--no-model` |
-| `haunt` | Persona-voiced comments on the current diff | `--path` / `--repo`, `--author`, `--cutoff`, `--report`, `--no-model` |
+| `haunt` | Persona-voiced comments on the current diff | `--path` / `--repo`, `--author`, `--cutoff`, `--include-untracked`, `--report`, `--no-model` |
 | `export` | Write a new Markdown report | `--path` / `--output`, `--redact`, `--no-model` |
 | `forget` | Remove stored evidence, narration, and application-owned temporary/report files | `--yes` |
 
 Sources are `folder`, `browser`, `windows`, and `git`. Repeat `--source` on `dig`
 or give comma-separated values. With no source selection, `dig` attempts every
 available source; folder and repository sources still require a path. Unavailable
-sources are listed and skipped. Each source reports progress and its saved count.
+sources are listed and skipped. Each source reports progress, saved artifacts,
+and warning counts. An inaccessible item or skipped profile does not fail a
+completed source. A source that cannot complete still produces exit code 2.
 
 ```powershell
 exhume dig --source browser --profile 'edge:Default'
@@ -116,15 +118,24 @@ Exhume does not change that configuration.
 ### Haunt the current diff
 
 ```powershell
+$env:EXHUME_HOME = 'D:\ExhumeData'
 exhume haunt --path 'D:\Repositories\Archive' --author 'owner@example.invalid' --no-model
 exhume haunt --path 'D:\Repositories\Archive' --author 'owner@example.invalid' --cutoff '2023-01-01' --report review.md
 ```
 
+Keep `EXHUME_HOME` outside the repository being read. `haunt` and Git scans reject
+data directories inside the working tree, including resolved links and drive
+aliases, before creating application files. Discovery scans require the data
+directory outside the discovery root as well.
+
 The default persona cutoff is UTC midnight eighteen months before today's date. Persona
 evidence comes only from matching commits strictly before that cutoff. The diff
-includes staged and working-directory changes against HEAD, with file and line
-caps. Binary, linked, or oversized content is omitted. A clean tree produces a
-neutral message.
+includes tracked staged and working-directory changes against HEAD, with file
+and line caps. Add `--include-untracked` explicitly to include new untracked
+files; tracked edits have priority and application data stays excluded. Omitted
+file counts and truncated chunks are shown. Binary, linked, or oversized content
+is omitted. A clean tree produces a neutral message. Persona cache hits avoid
+rebuilding historical input; chunks without citable lines make no model calls.
 
 Accepted comments must match the supplied file and a real new-file line visible
 in the bounded prompt. There are at most five comments per file, each at most
@@ -180,7 +191,10 @@ The configured Ollama URL is the application's only HTTP destination. Keep it
 local to keep narration evidence on the machine. Redirects and proxies are
 disabled for model calls. Transport failures, timeouts, malformed JSON, and
 invalid response shapes are retried with bounded attempts; exhausted narration
-falls back to raw evidence and a visible warning.
+falls back to raw evidence and a visible warning. After exhausted transport or
+timeout failures, remaining items in that command use cache or raw evidence
+without repeating connection retries. A new command can retry the endpoint.
+Non-loopback narration displays a warning that evidence may leave the machine.
 
 Narration views report their model-call count. Repeating a cached view makes zero
 generation calls. Cache keys include narration kind, artifact or source/month
@@ -188,7 +202,13 @@ identity, prompt version, and model tag. Persona identity uses repository, autho
 and cutoff; haunt identity also includes the persona and current diff. Re-scanning
 an existing artifact does not invalidate its narration by itself. Change the
 prompt version or model tag to produce a new narration, or use `forget` to clear
-the stored evidence and cache together.
+the stored evidence and cache together. Era prompts prioritize the most active
+domains/categories/repositories within the character budget. Haunt JSON uses an
+object containing a `comments` array; haunt and era prompt versions are now 2.
+
+Per-call size, duration, attempt, and outcome records are written to
+`<data directory>/logs/narration.jsonl`. These records omit evidence, model
+output, and endpoint addresses. Diagnostics never follow linked log locations.
 
 ## Export and privacy
 
@@ -203,8 +223,11 @@ reports can contain private paths, titles, commit subjects, and sample names.
 
 Redacted exports replace browser titles, reduce file samples to extensions, and
 keep domains. They also omit evidence paths, executable paths, commit subjects,
-installed-sibling names, and generated narration so cached prose cannot restore
-removed details. Redaction affects the report only; the local store is unchanged.
+installed-sibling names, and unknown metadata. Only short alphanumeric filename
+extensions survive. Obituary and era prose is generated from the sanitized
+evidence using a separate cache namespace; private cached prose is never reused.
+Add `--no-model` for a raw redacted report. Redaction affects the report only;
+the stored evidence is unchanged.
 Counts, dates, domains, and program names can still be identifying, so review the
 report before sharing it.
 
@@ -220,9 +243,10 @@ exhume doctor
 
 `forget` asks for confirmation in an interactive terminal. In a noninteractive
 session, it does nothing unless `--yes` is supplied. It clears the store and
-application-owned files under `temp/` and `reports/`, preserves unrelated files
+application-owned files under `temp/`, `reports/`, and `logs/`, preserves unrelated files
 and linked directories, and removes the data directory only if empty. Exports
-written elsewhere are not removed. A subsequent `doctor` opens an empty store.
+written elsewhere are not removed. Corrupt databases can be forgotten without
+opening them. A subsequent `doctor` opens an empty store.
 
 ## Verification and limits
 
@@ -235,11 +259,14 @@ The owner still needs to verify browser copying with a real running browser,
 high-confidence residue on the actual machine, representative old folders,
 useful line-bound comments on a real repository, and the configured model's
 availability and output quality. See the [acceptance checklist](docs/spec.md#18-acceptance-criteria)
-and [implementation decisions and proposals](docs/CHANGES.md).
+and [implementation decisions and proposals](docs/CHANGES.md). The
+[review resolution record](docs/REVIEW-2026-10-30.md) maps each finding to its fix
+or documented decision, and separates automated checks from live acceptance.
 
 Exit codes are `0` for success, including empty results and narration fallback;
-`1` for usage/configuration errors; `2` for a partial scan failure or cancellation;
-and `3` for unwritable application storage. Previously saved scan batches remain
+`1` for usage/configuration errors; `2` for a source failure or cancellation;
+and `3` for prohibited/unwritable application storage or an unavailable export
+destination. Recoverable item warnings alone return success. Previously saved scan batches remain
 after cancellation; the pending batch is discarded.
 
 The solution separates Core, Narration, the four source adapters, and the CLI.

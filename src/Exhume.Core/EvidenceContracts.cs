@@ -13,9 +13,11 @@ public sealed record ScanOptions
     public bool Elevated { get; init; }
     public bool ScanRepositories { get; init; }
     public string? TemporaryDirectory { get; init; }
+    public bool IncludeUntracked { get; init; }
+    public IReadOnlyList<string> ExcludedPaths { get; init; } = [];
 }
 
-public sealed record ScanProgress(string Source, string Stage, long ItemsDone, long? Total = null, string? Error = null);
+public sealed record ScanProgress(string Source, string Stage, long ItemsDone, long? Total = null, string? Error = null, string? Warning = null);
 
 public interface IEvidenceAdapter
 {
@@ -25,7 +27,9 @@ public interface IEvidenceAdapter
         IProgress<ScanProgress>? progress = null, CancellationToken cancellationToken = default);
 }
 
-public sealed record DiffChunk(string File, string Text, IReadOnlyList<int> LineNumbers, bool Truncated = false);
+public sealed record DiffChunk(string File, string Text, IReadOnlyList<int> LineNumbers, bool Truncated = false, int OmittedFileCount = 0);
+
+public sealed record PersonaContext(string RepositoryPath, string Author, DateTimeOffset Cutoff);
 
 public sealed record PersonaInput(string RepositoryPath, string Author, DateTimeOffset Cutoff,
     int TotalCommitCount, IReadOnlyList<string> CommitSubjects, IReadOnlyList<DiffChunk> DiffSamples,
